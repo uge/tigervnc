@@ -5,10 +5,12 @@ on:
   push:
     paths:
       - contrib/vscode-vnc-tcp/**
+      - contrib/web-vnc-client/**
       - .github/workflows/vscode-vsix.yml
   pull_request:
     paths:
       - contrib/vscode-vnc-tcp/**
+      - contrib/web-vnc-client/**
       - .github/workflows/vscode-vsix.yml
 
 jobs:
@@ -31,6 +33,12 @@ jobs:
             echo "Missing contrib/vscode-vnc-tcp/package.json"
             exit 1
           }
+
+      - name: Build web-vnc-client
+        working-directory: contrib/web-vnc-client
+        run: |
+          npm ci
+          npm run build
 
       - name: Install extension dependencies
         working-directory: contrib/vscode-vnc-tcp
