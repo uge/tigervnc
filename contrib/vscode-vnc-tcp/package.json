@@ -1,0 +1,169 @@
+{
+  "name": "tigervnc-vscode",
+  "displayName": "TigerVNC VS Code Viewer",
+  "description": "VS Code VNC extension that connects directly over TCP (no WebSocket transport).",
+  "version": "0.1.3",
+  "publisher": "tigervnc",
+  "icon": "media/tigervnc_128.png",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:tigervncVscode.openSession",
+    "onView:tigervncVscode.savedEndpoints"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "tigervncVscode.openSession",
+        "title": "TigerVNC VS Code: Open Session",
+        "icon": {
+          "light": "media/icons/light/open-session.svg",
+          "dark": "media/icons/dark/open-session.svg"
+        }
+      },
+      {
+        "command": "tigervncVscode.addSavedEndpoint",
+        "title": "TigerVNC VS Code: Add Saved Endpoint",
+        "icon": {
+          "light": "media/icons/light/add.svg",
+          "dark": "media/icons/dark/add.svg"
+        }
+      },
+      {
+        "command": "tigervncVscode.connectSavedEndpoint",
+        "title": "TigerVNC VS Code: Connect Saved Endpoint",
+        "icon": {
+          "light": "media/icons/light/connect.svg",
+          "dark": "media/icons/dark/connect.svg"
+        }
+      },
+      {
+        "command": "tigervncVscode.editSavedEndpoint",
+        "title": "TigerVNC VS Code: Edit Saved Endpoint",
+        "icon": {
+          "light": "media/icons/light/edit.svg",
+          "dark": "media/icons/dark/edit.svg"
+        }
+      },
+      {
+        "command": "tigervncVscode.removeSavedEndpoint",
+        "title": "TigerVNC VS Code: Remove Saved Endpoint",
+        "icon": {
+          "light": "media/icons/light/remove.svg",
+          "dark": "media/icons/dark/remove.svg"
+        }
+      },
+      {
+        "command": "tigervncVscode.openSettings",
+        "title": "TigerVNC VS Code: Open Settings",
+        "icon": {
+          "light": "media/icons/light/settings.svg",
+          "dark": "media/icons/dark/settings.svg"
+        }
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tigervncVscode",
+          "title": "TigerVNC VS Code",
+          "icon": "media/activitybar.svg"
+        }
+      ]
+    },
+    "views": {
+      "tigervncVscode": [
+        {
+          "id": "tigervncVscode.savedEndpoints",
+          "name": "Saved Endpoints"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "tigervncVscode.addSavedEndpoint",
+          "when": "view == tigervncVscode.savedEndpoints",
+          "group": "navigation"
+        },
+        {
+          "command": "tigervncVscode.openSettings",
+          "when": "view == tigervncVscode.savedEndpoints",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "tigervncVscode.connectSavedEndpoint",
+          "when": "view == tigervncVscode.savedEndpoints && viewItem == tigervncVscodeSavedEndpoint",
+          "group": "inline"
+        },
+        {
+          "command": "tigervncVscode.editSavedEndpoint",
+          "when": "view == tigervncVscode.savedEndpoints && viewItem == tigervncVscodeSavedEndpoint",
+          "group": "inline"
+        },
+        {
+          "command": "tigervncVscode.removeSavedEndpoint",
+          "when": "view == tigervncVscode.savedEndpoints && viewItem == tigervncVscodeSavedEndpoint",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "TigerVNC VS Code",
+      "properties": {
+        "tigervncVscode.defaultHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Default VNC host used by the Open Session command."
+        },
+        "tigervncVscode.defaultPort": {
+          "type": "number",
+          "default": 5900,
+          "description": "Default VNC port used by the Open Session command."
+        },
+        "tigervncVscode.autoSelectProtocolDepth": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically adapt protocol and color-depth policy based on measured latency and bandwidth."
+        },
+        "tigervncVscode.autoSelectMinSwitchIntervalMs": {
+          "type": "number",
+          "default": 4000,
+          "minimum": 500,
+          "description": "Minimum interval between automatic adaptation profile changes."
+        },
+        "tigervncVscode.enableClipboardSharing": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable clipboard sharing by default for new sessions."
+        },
+        "tigervncVscode.restorePreviousSessionOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically reopen the most recent TigerVNC session when VS Code starts or reloads."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "sync-client-dist": "node ./scripts/sync-client-dist.mjs",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npm run sync-client-dist && vsce package"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.16.5",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.6.3",
+    "vsce": "^2.15.0"
+  }
+}
