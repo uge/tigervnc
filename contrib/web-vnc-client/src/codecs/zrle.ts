@@ -40,7 +40,21 @@ export class ZrleDecoder {
    * @param maxOut - upper bound on decompressed size (w * h * 4 bytes)
    */
   private decompress(data: Uint8Array, maxOut: number): Uint8Array {
-    return this.inflate.decompress(data, maxOut);
+    try {
+      return this.inflate.decompress(data, maxOut);
+    } catch (err) {
+      // Some servers unexpectedly restart the ZRLE zlib stream around desktop
+      // transitions. Try one in-place resync by resetting inflate and
+      // re-decoding the same rectangle payload.
+      this.inflate.reset();
+      try {
+        const out = this.inflate.decompress(data, maxOut);
+        console.warn("[ZRLE] inflate resynced after reset");
+        return out;
+      } catch {
+        throw err;
+      }
+    }
   }
 
   /**
