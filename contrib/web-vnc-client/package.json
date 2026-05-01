@@ -1,0 +1,25 @@
+{
+  "name": "web-vnc-client",
+  "version": "0.1.0",
+  "description": "Browser-based VNC client built on vnc-decoder codec logic",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "build:wasm:zlib": "bash ./scripts/build-wasm-zlib.sh",
+    "preview": "vite preview",
+    "proxy": "node proxy.mjs",
+    "proxy:public": "node proxy.mjs --host 0.0.0.0 --allow-origin \"*\""
+  },
+  "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.10",
+    "@ffmpeg/util": "^0.12.1",
+    "des.js": "^1.1.0",
+    "fflate": "^0.8.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "vite": "^5.0.0",
+    "ws": "^8.18.0"
+  }
+}

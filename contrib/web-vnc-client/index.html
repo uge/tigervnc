@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TigerVNC VS Code</title>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+      :root {
+        --bg:       #1a1a2e;
+        --surface:  #16213e;
+        --border:   #0f3460;
+        --accent:   #e94560;
+        --text:     #eaeaea;
+        --muted:    #8892a4;
+        --green:    #27ae60;
+        --radius:   6px;
+        --toolbar-h: 52px;
+      }
+
+      html, body {
+        height: 100%;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--text);
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 14px;
+      }
+
+      /* ── Toolbar ─────────────────────────────────────────────────────── */
+      #toolbar {
+        position: fixed;
+        top: 0; left: 0; right: 0;
+        height: var(--toolbar-h);
+        background: var(--surface);
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 16px;
+        z-index: 100;
+      }
+
+      #toolbar .logo {
+        font-weight: 700;
+        font-size: 15px;
+        color: var(--accent);
+        white-space: nowrap;
+        margin-right: 8px;
+      }
+
+      #toolbar input {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        color: var(--text);
+        padding: 6px 10px;
+        outline: none;
+        font-size: 13px;
+      }
+      #toolbar input:focus { border-color: var(--accent); }
+      #toolbar input::placeholder { color: var(--muted); }
+      #toolbar input:disabled { opacity: 0.5; cursor: not-allowed; }
+
+      /* ── Mode toggle ──────────────────────────────────────────────── */
+      #mode-toggle {
+        display: flex;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        overflow: hidden;
+        flex-shrink: 0;
+      }
+      .mode-btn {
+        background: transparent;
+        border: none;
+        color: var(--muted);
+        padding: 5px 12px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        transition: background 0.15s, color 0.15s;
+        white-space: nowrap;
+      }
+      .mode-btn.active {
+        background: var(--border);
+        color: var(--text);
+      }
+      .mode-btn:hover:not(.active) { background: rgba(255,255,255,0.05); }
+
+      /* Mode-specific field groups */
+      .mode-ws, .mode-tcp { display: flex; align-items: center; gap: 8px; }
+      .mode-tcp { display: none; }
+
+      #input-vnc-host { flex: 1; min-width: 140px; max-width: 240px; }
+      #input-vnc-port { width: 70px; }
+      #input-proxy-port { width: 70px; }
+      .field-label {
+        color: var(--muted);
+        font-size: 11px;
+        white-space: nowrap;
+      }
+
+      #btn-connect {
+        background: var(--accent);
+        border: none;
+        border-radius: var(--radius);
+        color: #fff;
+        padding: 7px 18px;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 600;
+        white-space: nowrap;
+        transition: opacity 0.15s;
+      }
+      #btn-connect:hover { opacity: 0.85; }
+      #btn-connect.connected { background: var(--muted); }
+
+      #status {
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 200px;
+      }
+
+      #stats {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+      .stat-item {
+        width: 132px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex: 0 0 132px;
+        justify-content: space-between;
+      }
+      .stat-label {
+        flex: 0 0 auto;
+      }
+      .stat-value {
+        flex: 1 1 auto;
+        min-width: 0;
+        text-align: right;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #stats strong {
+        color: var(--text);
+        font-weight: 600;
+      }
+      #stats select {
+        width: 100%;
+        min-width: 0;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        color: var(--text);
+        padding: 4px 8px;
+        font-size: 12px;
+      }
+
+      /* VS Code embedded mode: remove the full top banner and use the whole webview for drawing. */
+      body.vscode-embed #toolbar {
+        display: none !important;
+      }
+      body.vscode-embed #status,
+      body.vscode-embed #stats {
+        display: none !important;
+      }
+      body.vscode-embed #main {
+        top: 0;
+      }
+
+      /* ── Clipboard toggle ────────────────────────────────────────── */
+      .clipboard-toggle {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: 0 0 auto;
+        cursor: pointer;
+        user-select: none;
+      }
+      .clipboard-toggle input[type="checkbox"] {
+        cursor: pointer;
+        width: 16px;
+        height: 16px;
+      }
+      .clipboard-toggle label {
+        cursor: pointer;
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+      .clipboard-toggle input[type="checkbox"]:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .clipboard-toggle input[type="checkbox"]:disabled + label {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      /* ── Main area ───────────────────────────────────────────────────── */
+      #main {
+        position: fixed;
+        top: var(--toolbar-h);
+        right: 0;
+        bottom: 0;
+        left: 0;
+        display: flex;
+        align-items: flex-start;
+        justify-content: flex-start;
+        overflow: auto;
+        background: #111;
+      }
+
+      /* ── Placeholder ─────────────────────────────────────────────────── */
+      #placeholder {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        height: 100%;
+        color: var(--muted);
+        text-align: center;
+        padding: 32px;
+      }
+      #placeholder h2 {
+        font-size: 24px;
+        color: var(--text);
+        letter-spacing: 0.4px;
+      }
+      #placeholder p {
+        font-size: 13px;
+        line-height: 1.6;
+        max-width: 420px;
+      }
+      #placeholder-settings-link {
+        margin-top: 4px;
+        color: var(--accent);
+        text-decoration: underline;
+        text-underline-offset: 2px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      #placeholder-settings-link:hover {
+        opacity: 0.85;
+      }
+
+      /* ── VNC Canvas ──────────────────────────────────────────────────── */
+      #vnc-canvas {
+        display: none;
+        image-rendering: pixelated;
+        outline: none;
+        max-width: 100%;
+        max-height: 100%;
+        width: auto;
+        height: auto;
+      }
+      #vnc-canvas:focus { outline: 2px solid var(--accent); }
+    </style>
+  </head>
+  <body>
+
+    <div id="toolbar">
+      <span class="logo">⬡ WebGL VNC</span>
+
+      <!-- Mode toggle -->
+      <div id="mode-toggle">
+        <button class="mode-btn active" data-mode="ws">WebSocket</button>
+        <button class="mode-btn" data-mode="tcp">TCP</button>
+      </div>
+
+      <!-- WebSocket mode -->
+      <div class="mode-ws">
+        <input
+          id="input-url"
+          type="text"
+          placeholder="ws://hostname:5900"
+          value="ws://localhost:5900"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <!-- TCP mode (via local proxy) -->
+      <div class="mode-tcp">
+        <span class="field-label">VNC host</span>
+        <input id="input-vnc-host" type="text" placeholder="hostname" value="localhost" autocomplete="off" spellcheck="false" />
+        <span class="field-label">port</span>
+        <input id="input-vnc-port" type="number" min="1" max="65535" value="5900" />
+        <span class="field-label">proxy</span>
+        <input id="input-proxy-port" type="number" min="1" max="65535" value="8900" />
+      </div>
+
+      <input
+        id="input-password"
+        type="password"
+        placeholder="Password (optional)"
+        autocomplete="current-password"
+      />
+
+      <button id="btn-connect">Connect</button>
+
+      <span id="status">Not connected</span>
+
+      <div id="stats">
+        <span class="stat-item">
+          <span class="stat-label">Enc</span>
+          <select id="encoding-mode" aria-label="Preferred encoding">
+            <option value="auto">Auto</option>
+            <option value="h264">H.264</option>
+            <option value="tight">Tight</option>
+            <option value="zrle">ZRLE</option>
+            <option value="hextile">Hextile</option>
+            <option value="raw">Raw</option>
+          </select>
+        </span>
+        <span class="stat-item">
+          <span class="stat-label">Cur</span>
+          <strong id="stat-current-encoding" class="stat-value">None</strong>
+        </span>
+        <span class="stat-item">
+          <span class="stat-label">Depth</span>
+          <strong id="stat-depth" class="stat-value">24-bit RGBX</strong>
+        </span>
+        <span class="stat-item">
+          <span class="stat-label">Rx</span>
+          <strong id="stat-rate" class="stat-value">0 B/s</strong>
+        </span>
+        <span class="stat-item">
+          <span class="stat-label">FPS</span>
+          <strong id="stat-fps" class="stat-value">0</strong>
+        </span>
+        <span class="stat-item">
+          <span class="stat-label">Upd/s</span>
+          <strong id="stat-ups" class="stat-value">0.0</strong>
+        </span>
+        <span class="stat-item">
+          <span class="stat-label">Frame</span>
+          <strong id="stat-frame" class="stat-value">0.0 ms</strong>
+        </span>
+        <span class="stat-item">
+          <span class="stat-label">Worker</span>
+          <strong id="stat-worker" class="stat-value">0.0 ms</strong>
+        </span>
+        <span class="stat-item">
+          <span class="stat-label">Blit</span>
+          <strong id="stat-blit" class="stat-value">0.0 ms</strong>
+        </span>
+        <span class="stat-item">
+          <span class="stat-label">Tight</span>
+          <strong id="stat-tight" class="stat-value">-</strong>
+        </span>
+        <span class="stat-item">
+          <span class="stat-label">Q</span>
+          <strong id="stat-queue" class="stat-value">0</strong>
+        </span>
+        <span class="stat-item">
+          <span class="stat-label">Limit</span>
+          <strong id="stat-limit" class="stat-value">balanced</strong>
+        </span>
+        <div class="clipboard-toggle">
+          <input
+            id="clipboard-toggle"
+            type="checkbox"
+            disabled
+            aria-label="Enable clipboard sharing"
+          />
+          <label for="clipboard-toggle">Clipboard</label>
+        </div>
+      </div>
+    </div>
+
+    <div id="main">
+      <div id="placeholder">
+        <h2>TigerVNC VS Code</h2>
+        <p>Not connected. Start a session from the sidebar or open settings to change TigerVNC VS Code defaults.</p>
+        <a id="placeholder-settings-link" href="#" role="button">Open TigerVNC VS Code Settings</a>
+      </div>
+
+      <canvas id="vnc-canvas"></canvas>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
