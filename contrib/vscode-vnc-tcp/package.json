@@ -2,7 +2,7 @@
   "name": "tigervnc-vscode",
   "displayName": "TigerVNC VS Code Viewer",
   "description": "VS Code VNC extension that connects directly over TCP (no WebSocket transport).",
-  "version": "0.1.25",
+  "version": "0.1.31",
   "publisher": "tigervnc",
   "icon": "media/tigervnc_128.png",
   "engines": {
@@ -149,6 +149,11 @@
           "type": "boolean",
           "default": false,
           "description": "Automatically reopen the most recent TigerVNC session when VS Code starts or reloads."
+        },
+        "tigervncVscode.enableDebugOutput": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable debug output in the VS Code Output panel for troubleshooting."
         }
       }
     }
@@ -157,7 +162,7 @@
     "sync-client-dist": "node ./scripts/sync-client-dist.mjs",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "npm run sync-client-dist && vsce package"
+    "package": "npm run sync-client-dist && npm run compile && vsce package"
   },
   "dependencies": {},
   "devDependencies": {

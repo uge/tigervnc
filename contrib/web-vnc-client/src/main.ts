@@ -117,11 +117,26 @@ let thumbnailTimer: number | null = null;
 
 const INITIAL_RESIZE_MAX_ATTEMPTS = 12;
 const INITIAL_RESIZE_RETRY_MS = 400;
-const BACKGROUND_REFRESH_FPS = 0.2;
+const BACKGROUND_REFRESH_FPS = 0; // Completely pause frame requests when tab is hidden
 const FOREGROUND_REFRESH_FPS = 60;
 const TAB_THUMBNAIL_INTERVAL_MS = 1500;
 const TAB_THUMBNAIL_SIZE = 32;
 const ENABLE_REMOTE_RESIZE = true;
+const MOUSE_MOVE_DELAY = 17; // Minimum ms between mouse move events (~60fps)
+
+// Debug output control
+let debugEnabled = false;
+
+// ── Keyboard state tracking ───────────────────────────────────────────────
+// Track pressed keys: code -> keysym. Ensures we use the same keysym on
+// release as on press, and prevents duplicate down events.
+const keyDownList = new Map<string, number>();
+
+// ── Mouse throttling state ────────────────────────────────────────────────
+let lastMouseMoveTime = 0;
+let mouseMoveTimer: number | null = null;
+let pendingMousePos: { x: number; y: number } | null = null;
+let pendingMouseButtons = 0;
 
 const DEFAULT_STATS: RfbClientStats = {
   encoding: "None",
@@ -171,6 +186,20 @@ function resetModifierKeys(): void {
   for (const keysym of MODIFIER_KEYSYMS) {
     client.sendKeyEvent(keysym, false);
   }
+  // Also clear our local tracking state
+  keyDownList.clear();
+}
+
+/**
+ * Release all currently pressed keys. Called on window blur to prevent
+ * stuck keys when focus is lost.
+ */
+function releaseAllKeys(): void {
+  if (!client || !connected) return;
+  for (const [code, keysym] of keyDownList) {
+    client.sendKeyEvent(keysym, false);
+  }
+  keyDownList.clear();
 }
 
 function formatDataRate(bytesPerSecond: number): string {
@@ -451,19 +480,8 @@ function onFrameWithDirtyRects(imageData: ImageData, dirtyRects: DirtyRect[]): v
 }
 
 function scheduleTabThumbnailUpdate(): void {
-  if (!connected || getVsCodeApi() === undefined) return;
-
-  const now = Date.now();
-  const delayMs = Math.max(0, TAB_THUMBNAIL_INTERVAL_MS - (now - lastThumbnailSentAt));
-  if (delayMs === 0) {
-    pushTabThumbnail();
-    return;
-  }
-  if (thumbnailTimer !== null) return;
-  thumbnailTimer = window.setTimeout(() => {
-    thumbnailTimer = null;
-    pushTabThumbnail();
-  }, delayMs);
+  // Disabled: using static TigerVNC icon instead of dynamic thumbnails
+  return;
 }
 
 function pushTabThumbnail(): void {
@@ -552,30 +570,101 @@ function requestResizeToViewport(): void {
 function onKeyDown(ev: KeyboardEvent): void {
   if (!client || !connected) return;
   ev.preventDefault();
+  
+  const code = ev.code;
+  
+  // If this key is already pressed, use the same keysym for the repeat
+  const existingSym = keyDownList.get(code);
+  if (existingSym !== undefined) {
+    // Send repeat (key already down, send same keysym again)
+    client.sendKeyEvent(existingSym, true);
+    return;
+  }
+  
   const sym = codeToKeysym(ev);
-  if (sym) client.sendKeyEvent(sym, true);
+  if (sym) {
+    keyDownList.set(code, sym);
+    client.sendKeyEvent(sym, true);
+  }
 }
 
 function onKeyUp(ev: KeyboardEvent): void {
   if (!client || !connected) return;
   ev.preventDefault();
-  const sym = codeToKeysym(ev);
-  if (sym) client.sendKeyEvent(sym, false);
+  
+  const code = ev.code;
+  
+  // Use the same keysym we sent on keydown
+  const sym = keyDownList.get(code);
+  if (sym !== undefined) {
+    keyDownList.delete(code);
+    client.sendKeyEvent(sym, false);
+  }
+}
+
+function onWindowBlur(): void {
+  releaseAllKeys();
+  // Also cancel any pending mouse move
+  if (mouseMoveTimer !== null) {
+    window.clearTimeout(mouseMoveTimer);
+    mouseMoveTimer = null;
+  }
+  pendingMousePos = null;
+}
+
+function flushPendingMouseMove(): void {
+  mouseMoveTimer = null;
+  if (!client || !connected || !pendingMousePos) return;
+  client.sendPointerEvent(pendingMousePos.x, pendingMousePos.y, pendingMouseButtons);
+  lastMouseMoveTime = Date.now();
+  pendingMousePos = null;
 }
 
 function onMouseMove(ev: MouseEvent): void {
   if (!client || !connected) return;
   const { x, y } = canvasPos(ev);
   const buttons = mouseButtons(ev.buttons);
-  client.sendPointerEvent(x, y, buttons);
+  
+  // Throttle mouse moves to ~60fps to avoid flooding the server
+  const now = Date.now();
+  const timeSinceLastMove = now - lastMouseMoveTime;
+  
+  if (timeSinceLastMove >= MOUSE_MOVE_DELAY) {
+    // Enough time has passed, send immediately
+    client.sendPointerEvent(x, y, buttons);
+    lastMouseMoveTime = now;
+    // Clear any pending move
+    if (mouseMoveTimer !== null) {
+      window.clearTimeout(mouseMoveTimer);
+      mouseMoveTimer = null;
+    }
+    pendingMousePos = null;
+  } else {
+    // Too soon, queue the move
+    pendingMousePos = { x, y };
+    pendingMouseButtons = buttons;
+    if (mouseMoveTimer === null) {
+      mouseMoveTimer = window.setTimeout(flushPendingMouseMove, MOUSE_MOVE_DELAY - timeSinceLastMove);
+    }
+  }
 }
 
 function onMouseDown(ev: MouseEvent): void {
   if (!client || !connected) return;
   ev.preventDefault();
   canvas.focus();
+  // Flush any pending mouse move before button press
+  if (pendingMousePos) {
+    if (mouseMoveTimer !== null) {
+      window.clearTimeout(mouseMoveTimer);
+      mouseMoveTimer = null;
+    }
+    client.sendPointerEvent(pendingMousePos.x, pendingMousePos.y, pendingMouseButtons);
+    pendingMousePos = null;
+  }
   const { x, y } = canvasPos(ev);
   client.sendPointerEvent(x, y, mouseButtons(ev.buttons));
+  lastMouseMoveTime = Date.now();
 }
 
 function onMouseUp(ev: MouseEvent): void {
@@ -836,6 +925,7 @@ function buildUrl(): string | null {
 }
 
 function postDebug(msg: string): void {
+  if (!debugEnabled) return;
   getVsCodeApi()?.postMessage({ type: "vnc:debug", message: msg });
 }
 
@@ -908,6 +998,13 @@ function doDisconnect(): void {
   pendingFrame = null;
   frameFlushScheduled = false;
   stopInitialResizeRetry();
+  // Clear keyboard and mouse state
+  keyDownList.clear();
+  if (mouseMoveTimer !== null) {
+    window.clearTimeout(mouseMoveTimer);
+    mouseMoveTimer = null;
+  }
+  pendingMousePos = null;
   setStatus("Disconnected");
 }
 
@@ -927,10 +1024,12 @@ function init(): void {
         protocolOverride?: RfbEncodingMode;
         colorDepthOverride?: SessionColorDepth;
         clipboardEnabled?: boolean;
+        debugEnabled?: boolean;
       };
     }
   ).__VNC_TCP_PRESET__;
   if (preset) {
+    debugEnabled = preset.debugEnabled ?? false;
     adaptiveProtocolDepthEnabled = preset.autoSelectProtocolDepth ?? adaptiveProtocolDepthEnabled;
     adaptiveMinSwitchIntervalMs = preset.autoSelectMinSwitchIntervalMs ?? adaptiveMinSwitchIntervalMs;
     selectedEncodingMode = preset.protocolOverride ?? selectedEncodingMode;
@@ -961,6 +1060,9 @@ function init(): void {
   canvas.addEventListener("mouseup", onMouseUp);
   canvas.addEventListener("wheel", onWheel, { passive: false });
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+  
+  // Release all keys when window loses focus to prevent stuck keys
+  window.addEventListener("blur", onWindowBlur);
 
   el("btn-connect").addEventListener("click", () => {
     if (connected) doDisconnect();

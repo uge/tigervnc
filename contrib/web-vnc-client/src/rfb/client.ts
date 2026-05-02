@@ -582,7 +582,8 @@ export class RfbClient {
   }
 
   setTargetFrameRate(fps: number): void {
-    this.targetFrameRate = Math.max(0.2, fps);
+    // Allow 0 to completely pause frame requests (e.g., when tab is hidden)
+    this.targetFrameRate = Math.max(0, fps);
   }
 
   /**
@@ -1099,6 +1100,15 @@ export class RfbClient {
    * and to reduce input-to-display latency by pacing updates.
    */
   private sendAdaptiveFramebufferUpdateRequest(): void {
+    // If target frame rate is 0, don't request any updates (tab is hidden/paused)
+    if (this.targetFrameRate <= 0) {
+      if (this.frameRequestTimer !== null) {
+        window.clearTimeout(this.frameRequestTimer);
+        this.frameRequestTimer = null;
+      }
+      return;
+    }
+
     const now = Date.now();
     const timeSinceLastFrame = now - this.lastFrameUpdateTime;
     

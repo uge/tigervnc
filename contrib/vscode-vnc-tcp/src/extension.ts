@@ -410,8 +410,26 @@ function iconForStat(key: string): string {
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("VNC");
   context.subscriptions.push(output);
-  output.show(true); // surface the channel; preserves user focus
-  output.appendLine("[VNC] Extension activated");
+
+  /** Check if debug output is enabled in settings. */
+  const isDebugEnabled = (): boolean => {
+    const cfg = vscode.workspace.getConfiguration("tigervncVscode");
+    return Boolean(cfg.get("enableDebugOutput") ?? false);
+  };
+
+  /** Log a debug message (only if debug output is enabled). */
+  const logDebug = (msg: string): void => {
+    if (isDebugEnabled()) {
+      output.appendLine(msg);
+    }
+  };
+
+  /** Log an error message (always shown). */
+  const logError = (msg: string): void => {
+    output.appendLine(msg);
+  };
+
+  logDebug("[VNC] Extension activated");
 
   let endpoints = context.globalState.get<SavedEndpoint[]>(SAVED_ENDPOINTS_KEY, []);
   if (endpoints.length === 0) {
@@ -466,7 +484,7 @@ export function activate(context: vscode.ExtensionContext): void {
     try {
       void panel.webview.postMessage(message);
     } catch (err: unknown) {
-      output.appendLine(
+      logDebug(
         `[VNC] Skipping webview post (${contextLabel}): ${err instanceof Error ? err.message : String(err)}`
       );
     }
@@ -480,7 +498,7 @@ export function activate(context: vscode.ExtensionContext): void {
     } catch (err: unknown) {
       // The panel reference is stale (disposed). Drop the claim and allow
       // the caller to create a fresh session panel.
-      output.appendLine(
+      logDebug(
         `[VNC] Removing stale claimed panel for ${endpointKey}: ${err instanceof Error ? err.message : String(err)}`
       );
       if (claimedPanelsByEndpoint.get(endpointKey) === state) {
@@ -555,21 +573,21 @@ export function activate(context: vscode.ExtensionContext): void {
   const persistEndpointUpdate = async (endpoint: SavedEndpoint, logMessage: string): Promise<void> => {
     endpoints = endpoints.map((candidate) => (candidate.id === endpoint.id ? endpoint : candidate));
     await saveEndpoints();
-    output.appendLine(logMessage);
+    logDebug(logMessage);
     pushEndpointOverridesToActiveSession(endpoint);
     provider.refresh(provider.getEndpointItemById(endpoint.id));
   };
 
   context.subscriptions.push(
     vscode.commands.registerCommand("tigervncVscode.openSettings", async () => {
-      output.appendLine("[VNC] Opening TigerVNC VS Code settings");
+      logDebug("[VNC] Opening TigerVNC VS Code settings");
       await vscode.commands.executeCommand("workbench.action.openSettings", "tigervncVscode");
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("tigervncVscode.openSession", async (options?: OpenSessionOptions) => {
-      output.appendLine(`[VNC] Opening session panel for ${options?.host ?? "127.0.0.1"}:${options?.port ?? 5900}`);
+      logDebug(`[VNC] Opening session panel for ${options?.host ?? "127.0.0.1"}:${options?.port ?? 5900}`);
       const cfg = vscode.workspace.getConfiguration("tigervncVscode");
       const legacyCfg = vscode.workspace.getConfiguration("vncTcp");
       const defaultHost = options?.host
@@ -584,6 +602,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const autoSelectMinSwitchIntervalMs = Number(
         cfg.get("autoSelectMinSwitchIntervalMs") ?? legacyCfg.get("autoSelectMinSwitchIntervalMs", 4000)
       );
+      const debugEnabled = Boolean(cfg.get("enableDebugOutput") ?? false);
       const clientDistUri = vscode.Uri.joinPath(context.extensionUri, "media", "client-dist");
       const endpointId = options?.endpointId;
       const clipboardEnabled = options?.clipboardOverride ?? defaultClipboardSharing;
@@ -600,7 +619,7 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         rawHtml = await readFile(vscode.Uri.joinPath(clientDistUri, "index.html").fsPath, "utf8");
       } catch {
-        output.appendLine("[VNC] ERROR: client-dist/index.html is missing; sync-client-dist is required");
+        logError("[VNC] ERROR: client-dist/index.html is missing; sync-client-dist is required");
         vscode.window.showErrorMessage(
           "web-vnc-client dist assets are missing. Run: npm run sync-client-dist in tigervnc-vscode."
         );
@@ -617,6 +636,9 @@ export function activate(context: vscode.ExtensionContext): void {
           localResourceRoots: [clientDistUri],
         }
       );
+
+      // Use static TigerVNC icon for the tab
+      panel.iconPath = vscode.Uri.joinPath(context.extensionUri, "media", "tigervnc-logo.svg");
 
       const panelState: PanelSessionState = {
         panel,
@@ -677,7 +699,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
       panel.webview.onDidReceiveMessage((msg: WebviewToExtMessage) => {
         if (msg.type === "connect") {
-          output.appendLine(`[VNC] Connect requested for ${msg.host}:${msg.port}`);
+          logDebug(`[VNC] Connect requested for ${msg.host}:${msg.port}`);
           panel.title = `VNC ${msg.host}:${msg.port}`;
           const latestEndpoint = endpointId ? getEndpointById(endpointId) : undefined;
           saveLastSession({
@@ -706,7 +728,7 @@ export function activate(context: vscode.ExtensionContext): void {
           activeSession = new TcpSession(msg.host, msg.port, (event) => {
             switch (event.type) {
               case "connected":
-                output.appendLine(`[VNC] TCP connected ${msg.host}:${msg.port} (${event.sessionId})`);
+                logDebug(`[VNC] TCP connected ${msg.host}:${msg.port} (${event.sessionId})`);
                 postToPanel(panel, { type: "tcp:connected", sessionId: event.sessionId }, "tcpConnected");
                 updateSnapshot({ connected: true, status: "Connected" });
                 break;
@@ -718,7 +740,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 }, "tcpData");
                 break;
               case "closed":
-                output.appendLine(`[VNC] TCP closed ${msg.host}:${msg.port} (${event.sessionId}): ${event.reason ?? "Socket closed"}`);
+                logDebug(`[VNC] TCP closed ${msg.host}:${msg.port} (${event.sessionId}): ${event.reason ?? "Socket closed"}`);
                 postToPanel(panel, {
                   type: "tcp:closed",
                   sessionId: event.sessionId,
@@ -729,7 +751,7 @@ export function activate(context: vscode.ExtensionContext): void {
                 updateSnapshot({ connected: false, status: event.reason ?? "Socket closed" });
                 break;
               case "error":
-                output.appendLine(`[VNC] ERROR: TCP error ${msg.host}:${msg.port} (${event.sessionId}): ${event.message}`);
+                logError(`[VNC] ERROR: TCP error ${msg.host}:${msg.port} (${event.sessionId}): ${event.message}`);
                 postToPanel(panel, {
                   type: "tcp:error",
                   sessionId: event.sessionId,
@@ -747,17 +769,14 @@ export function activate(context: vscode.ExtensionContext): void {
           }
         } else if (msg.type === "disconnect") {
           if (activeSession?.sessionId === msg.sessionId) {
-            output.appendLine(`[VNC] Disconnect requested for session ${msg.sessionId}`);
+            logDebug(`[VNC] Disconnect requested for session ${msg.sessionId}`);
             activeSession.disconnect();
             activeSession = null;
             releaseClaim(panelState);
             updateSnapshot({ connected: false, status: "Disconnected" });
           }
         } else if (msg.type === "vnc:thumbnail") {
-          if (!panelState.claimedEndpointKey) return;
-          void updatePanelThumbnail(panelState, panelState.claimedEndpointKey, msg.dataUrl).catch((err: unknown) => {
-            output.appendLine(`[VNC] Thumbnail update failed: ${err instanceof Error ? err.message : String(err)}`);
-          });
+          // Ignore dynamic thumbnails; using static TigerVNC icon instead
         } else if (msg.type === "vnc:stats") {
           updateSnapshot({
             protocol: msg.stats.encoding,
@@ -776,21 +795,21 @@ export function activate(context: vscode.ExtensionContext): void {
             workerFallbackActive: msg.stats.workerFallbackActive ?? false,
           }, SIDEBAR_STATS_REFRESH_MS);
         } else if (msg.type === "vnc:status") {
-          output.appendLine(`[VNC] Webview status: ${msg.message}`);
+          logDebug(`[VNC] Webview status: ${msg.message}`);
           updateSnapshot({ status: msg.message });
         } else if (msg.type === "vnc:debug") {
-          output.appendLine(`[VNC][DBG] ${msg.message}`);
+          logDebug(`[VNC][DBG] ${msg.message}`);
         } else if (msg.type === "vnc:openSettings") {
-          output.appendLine("[VNC] Webview requested settings");
+          logDebug("[VNC] Webview requested settings");
           void vscode.commands.executeCommand("tigervncVscode.openSettings");
         } else if (msg.type === "vnc:connectedState") {
-          output.appendLine(`[VNC] Webview connected state: ${msg.connected}`);
+          logDebug(`[VNC] Webview connected state: ${msg.connected}`);
           updateSnapshot({ connected: msg.connected });
         }
       });
 
       panel.onDidDispose(() => {
-        output.appendLine(`[VNC] Session panel disposed for ${panel.title}`);
+        logDebug(`[VNC] Session panel disposed for ${panel.title}`);
         activeSession?.disconnect();
         activeSession = null;
         releaseClaim(panelState);
@@ -807,7 +826,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
       panel.onDidChangeViewState((event) => {
         if (event.webviewPanel.visible) {
-          output.appendLine(`[VNC] Session panel exposed: ${event.webviewPanel.title}`);
+          logDebug(`[VNC] Session panel exposed: ${event.webviewPanel.title}`);
           postToPanel(event.webviewPanel, { type: "vnc:exposed" }, "panelExposed");
         }
       });
@@ -823,7 +842,8 @@ export function activate(context: vscode.ExtensionContext): void {
         autoSelectMinSwitchIntervalMs,
         options?.protocolOverride,
         options?.colorDepthOverride,
-        clipboardEnabled
+        clipboardEnabled,
+        debugEnabled
       );
     })
   );
@@ -887,7 +907,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
       endpoints = [...endpoints, endpoint];
       await saveEndpoints();
-      output.appendLine(`[VNC] Saved endpoint added: ${endpoint.name} (${endpoint.host}:${endpoint.port})`);
+      logDebug(`[VNC] Saved endpoint added: ${endpoint.name} (${endpoint.host}:${endpoint.port})`);
 
       if (password) {
         await context.secrets.store(`${SECRET_PREFIX}${endpoint.id}`, password);
@@ -1042,7 +1062,7 @@ export function activate(context: vscode.ExtensionContext): void {
       endpoints = endpoints.filter((e) => e.id !== endpoint.id);
       await saveEndpoints();
       await clearPassword(endpoint.id);
-      output.appendLine(`[VNC] Saved endpoint removed: ${endpoint.name} (${endpoint.host}:${endpoint.port})`);
+      logDebug(`[VNC] Saved endpoint removed: ${endpoint.name} (${endpoint.host}:${endpoint.port})`);
       provider.refresh();
     })
   );
@@ -1052,7 +1072,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const endpoint = item instanceof SavedEndpointItem ? item.endpoint : item;
       if (!endpoint) return;
 
-      output.appendLine(`[VNC] Opening saved endpoint: ${endpoint.name} (${endpoint.host}:${endpoint.port})`);
+      logDebug(`[VNC] Opening saved endpoint: ${endpoint.name} (${endpoint.host}:${endpoint.port})`);
       const password = await readPassword(endpoint.id);
       await vscode.commands.executeCommand("tigervncVscode.openSession", {
         host: endpoint.host,
@@ -1070,7 +1090,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const lastSession = context.globalState.get<LastSessionSnapshot | undefined>(LAST_SESSION_KEY);
     if (lastSession?.host && Number.isInteger(lastSession.port) && lastSession.port > 0) {
       void (async () => {
-        output.appendLine(`[VNC] Restoring previous session ${lastSession.host}:${lastSession.port}`);
+        logDebug(`[VNC] Restoring previous session ${lastSession.host}:${lastSession.port}`);
         const endpoint = lastSession.endpointId ? getEndpointById(lastSession.endpointId) : undefined;
         const password = endpoint ? await readPassword(endpoint.id) : "";
         await vscode.commands.executeCommand("tigervncVscode.openSession", {
@@ -1102,7 +1122,8 @@ function buildClientHtml(
   autoSelectMinSwitchIntervalMs: number,
   protocolOverride?: EndpointEncodingMode,
   colorDepthOverride?: EndpointColorDepth,
-  clipboardEnabled?: boolean
+  clipboardEnabled?: boolean,
+  debugEnabled?: boolean
 ): string {
   const preset = {
     mode: "tcp",
@@ -1114,6 +1135,7 @@ function buildClientHtml(
     protocolOverride,
     colorDepthOverride,
     clipboardEnabled,
+    debugEnabled,
   };
 
   const wasmUri = webview.asWebviewUri(vscode.Uri.joinPath(clientDistUri, "zlib-inflate.wasm")).toString();
