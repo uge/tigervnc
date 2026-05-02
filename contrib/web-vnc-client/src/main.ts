@@ -29,9 +29,21 @@ const KEY_END        = 0xff57;
 const KEY_INSERT     = 0xff63;
 const KEY_F1         = 0xffbe;
 const KEY_SHIFT_L    = 0xffe1;
+const KEY_SHIFT_R    = 0xffe2;
 const KEY_CONTROL_L  = 0xffe3;
+const KEY_CONTROL_R  = 0xffe4;
 const KEY_ALT_L      = 0xffe9;
+const KEY_ALT_R      = 0xffea;
 const KEY_SUPER_L    = 0xffeb;
+const KEY_SUPER_R    = 0xffec;
+
+/** All modifier keysyms to release on session connect. */
+const MODIFIER_KEYSYMS = [
+  KEY_SHIFT_L, KEY_SHIFT_R,
+  KEY_CONTROL_L, KEY_CONTROL_R,
+  KEY_ALT_L, KEY_ALT_R,
+  KEY_SUPER_L, KEY_SUPER_R,
+];
 
 /** Map a browser KeyboardEvent.code to an X11 KeySym. */
 function codeToKeysym(ev: KeyboardEvent): number {
@@ -143,6 +155,22 @@ function el<T extends HTMLElement>(id: string): T {
 function setStatus(msg: string): void {
   el("status").textContent = msg;
   getVsCodeApi()?.postMessage({ type: "vnc:status", message: msg });
+
+  // Reset modifier keys when connection is established to clear any stuck state.
+  if (msg === "Connected") {
+    resetModifierKeys();
+  }
+}
+
+/**
+ * Send key-up events for all modifier keys to reset keyboard state.
+ * Called on session connect to ensure modifiers are not stuck from previous sessions.
+ */
+function resetModifierKeys(): void {
+  if (!client || !connected) return;
+  for (const keysym of MODIFIER_KEYSYMS) {
+    client.sendKeyEvent(keysym, false);
+  }
 }
 
 function formatDataRate(bytesPerSecond: number): string {
