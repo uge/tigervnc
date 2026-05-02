@@ -26,10 +26,13 @@ type WebviewToExtMessage =
         autoProtocol?: string;
         autoColorDepth?: string;
         fps?: number;
+        inflateBackend?: "wasm" | "fflate";
+        workerFallbackActive?: boolean;
       };
     }
   | { type: "vnc:status"; message: string }
   | { type: "vnc:openSettings" }
+  | { type: "vnc:debug"; message: string }
   | { type: "vnc:connectedState"; connected: boolean };
 
 interface SavedEndpoint {
@@ -77,6 +80,8 @@ interface ConnectionSnapshot {
   latencyMs: number;
   fps: number;
   bottleneckHint: "server-limited" | "client-limited" | "balanced";
+  inflateBackend?: "wasm" | "fflate";
+  workerFallbackActive: boolean;
   lastUpdated: number;
 }
 
@@ -233,7 +238,7 @@ class SavedEndpointsProvider implements vscode.TreeDataProvider<VncTreeItem> {
       ];
 
       if (!snap?.connected) return overrideItems;
-      return [
+      const statsItems: VncTreeItem[] = [
         ...overrideItems,
         new StatItem(element.endpoint.id, "protocol", "Protocol", snap.protocol),
         new StatItem(element.endpoint.id, "autoProtocol", "Auto", snap.autoProtocol),
@@ -249,6 +254,16 @@ class SavedEndpointsProvider implements vscode.TreeDataProvider<VncTreeItem> {
         new StatItem(element.endpoint.id, "bottleneckHint", "Bottleneck", snap.bottleneckHint),
         new StatItem(element.endpoint.id, "status", "Status", snap.status),
       ];
+
+      if (snap.inflateBackend === "fflate") {
+        statsItems.push(new StatItem(element.endpoint.id, "fallback-inflate", "Zlib", "JavaScript fallback"));
+      }
+
+      if (snap.workerFallbackActive) {
+        statsItems.push(new StatItem(element.endpoint.id, "fallback-worker", "Decode worker", "Main-thread fallback"));
+      }
+
+      return statsItems;
     }
 
     return [];
@@ -384,6 +399,9 @@ function iconForStat(key: string): string {
       return "warning";
     case "status":
       return "info";
+    case "fallback-inflate":
+    case "fallback-worker":
+      return "warning";
     default:
       return "circle-small-filled";
   }
@@ -642,6 +660,7 @@ export function activate(context: vscode.ExtensionContext): void {
           latencyMs: 0,
           fps: 0,
           bottleneckHint: "balanced",
+          workerFallbackActive: false,
           ...previous,
           ...patch,
           lastUpdated: Date.now(),
@@ -753,10 +772,14 @@ export function activate(context: vscode.ExtensionContext): void {
             latencyMs: msg.stats.latencyMs,
             fps: msg.stats.fps ?? 0,
             bottleneckHint: msg.stats.bottleneckHint,
+            inflateBackend: msg.stats.inflateBackend,
+            workerFallbackActive: msg.stats.workerFallbackActive ?? false,
           }, SIDEBAR_STATS_REFRESH_MS);
         } else if (msg.type === "vnc:status") {
           output.appendLine(`[VNC] Webview status: ${msg.message}`);
           updateSnapshot({ status: msg.message });
+        } else if (msg.type === "vnc:debug") {
+          output.appendLine(`[VNC][DBG] ${msg.message}`);
         } else if (msg.type === "vnc:openSettings") {
           output.appendLine("[VNC] Webview requested settings");
           void vscode.commands.executeCommand("tigervncVscode.openSettings");

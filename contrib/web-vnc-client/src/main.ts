@@ -7,6 +7,7 @@
  * - Keyboard and mouse input forwarding
  */
 import { RfbClient, type RfbClientStats, type RfbEncodingMode, type DirtyRect } from "./rfb/client";
+import { getInflateBackendStatus } from "./codecs/tightInflateBackend";
 
 type SessionColorDepth = "8-bit" | "16-bit" | "24-bit";
 
@@ -89,6 +90,11 @@ let frameFlushScheduled = false;
 let hasRenderedFirstFrame = false;
 let isConnecting = false;
 let useDirtyRects = true; // High-performance dirty rectangle mode
+let frameCallbackCount = 0;
+let frameFlushCount = 0;
+let zeroRectFrameCount = 0;
+let syncFirstFrameCount = 0;
+let lastSurfaceSignature = "";
 let fpsWindowStart = 0;
 let fpsWindowFrames = 0;
 let currentFps = 0;
@@ -103,6 +109,7 @@ const BACKGROUND_REFRESH_FPS = 0.2;
 const FOREGROUND_REFRESH_FPS = 60;
 const TAB_THUMBNAIL_INTERVAL_MS = 1500;
 const TAB_THUMBNAIL_SIZE = 32;
+const ENABLE_REMOTE_RESIZE = true;
 
 const DEFAULT_STATS: RfbClientStats = {
   encoding: "None",
@@ -158,6 +165,9 @@ function setStats(stats: RfbClientStats): void {
 
   maybeAdaptProtocolAndDepth(stats);
 
+  const inflateBackend = getInflateBackendStatus();
+  const workerFallbackActive = client ? client.isWorkerFallbackActive() : false;
+
   getVsCodeApi()?.postMessage({
     type: "vnc:stats",
     stats: {
@@ -165,6 +175,8 @@ function setStats(stats: RfbClientStats): void {
       fps: currentFps,
       autoProtocol: selectedEncodingMode,
       autoColorDepth: adaptiveColorDepth,
+      inflateBackend: inflateBackend ?? undefined,
+      workerFallbackActive,
     },
   });
 }
@@ -267,6 +279,11 @@ function setConnected(state: boolean): void {
   clipboardToggle.disabled = !state;
   if (!state) {
     hasRenderedFirstFrame = false;
+    frameCallbackCount = 0;
+    frameFlushCount = 0;
+    zeroRectFrameCount = 0;
+    syncFirstFrameCount = 0;
+    lastSurfaceSignature = "";
   }
   updateConnectionSurface();
   if (!state) {
@@ -287,18 +304,38 @@ function updateConnectionSurface(): void {
   const showPlaceholder = !connected && !isConnecting;
   canvas.style.display = showCanvas ? "block" : "none";
   el("placeholder").style.display = showPlaceholder ? "flex" : "none";
+
+  const signature = `connected=${connected} connecting=${isConnecting} firstFrame=${hasRenderedFirstFrame} canvas=${canvas.style.display} placeholder=${el("placeholder").style.display}`;
+  if (signature !== lastSurfaceSignature) {
+    lastSurfaceSignature = signature;
+    postDebug(`[Render] Surface: ${signature}`);
+  }
 }
 
 function markFirstFrameRendered(): void {
   if (hasRenderedFirstFrame) return;
   isConnecting = false;
   hasRenderedFirstFrame = true;
+  postDebug(`[Render] First frame marked rendered. canvas=${canvas.width}x${canvas.height} callbacks=${frameCallbackCount} flushes=${frameFlushCount}`);
   updateConnectionSurface();
 }
 
 // ── Canvas rendering ──────────────────────────────────────────────────────
 
 function onFrame(imageData: ImageData): void {
+  frameCallbackCount += 1;
+
+  // Guarantee visibility by drawing first frame synchronously.
+  if (!hasRenderedFirstFrame) {
+    syncFirstFrameCount += 1;
+    trackRenderedFrame(performance.now());
+    markFirstFrameRendered();
+    ctx.putImageData(imageData, 0, 0);
+    postDebug(`[Render] onFrame synchronous first draw #${syncFirstFrameCount}`);
+    scheduleTabThumbnailUpdate();
+    return;
+  }
+
   // Keep only the newest frame to avoid render queue buildup under load.
   pendingFrame = imageData;
   pendingDirtyRects = [];
@@ -306,6 +343,7 @@ function onFrame(imageData: ImageData): void {
 
   frameFlushScheduled = true;
   requestAnimationFrame(() => {
+    frameFlushCount += 1;
     const frame = pendingFrame;
     pendingFrame = null;
     pendingDirtyRects = [];
@@ -320,6 +358,19 @@ function onFrame(imageData: ImageData): void {
 }
 
 function onFrameWithDirtyRects(imageData: ImageData, dirtyRects: DirtyRect[]): void {
+  frameCallbackCount += 1;
+
+  // Guarantee visibility by drawing first frame synchronously.
+  if (!hasRenderedFirstFrame) {
+    syncFirstFrameCount += 1;
+    trackRenderedFrame(performance.now());
+    markFirstFrameRendered();
+    ctx.putImageData(imageData, 0, 0);
+    postDebug(`[Render] onFrameWithDirtyRects synchronous first draw #${syncFirstFrameCount} rects=${dirtyRects.length}`);
+    scheduleTabThumbnailUpdate();
+    return;
+  }
+
   // High-performance path: only update dirty rectangles
   pendingFrame = imageData;
   pendingDirtyRects = dirtyRects;
@@ -327,15 +378,28 @@ function onFrameWithDirtyRects(imageData: ImageData, dirtyRects: DirtyRect[]): v
 
   frameFlushScheduled = true;
   requestAnimationFrame(() => {
+    frameFlushCount += 1;
     const frame = pendingFrame;
     const rects = pendingDirtyRects;
     pendingFrame = null;
     pendingDirtyRects = [];
     frameFlushScheduled = false;
-    if (!frame || rects.length === 0) return;
+    if (!frame) return;
 
     trackRenderedFrame(performance.now());
     markFirstFrameRendered();
+
+    if (rects.length === 0) {
+      zeroRectFrameCount += 1;
+      if (zeroRectFrameCount <= 5 || zeroRectFrameCount % 60 === 0) {
+        postDebug(`[Render] zero-dirty-rect frame #${zeroRectFrameCount}; full blit`);
+      }
+      // No dirty rects (e.g. frame contained only pseudo-encoding updates).
+      // Still commit a full blit so the canvas becomes visible on first frame.
+      ctx.putImageData(frame, 0, 0);
+      scheduleTabThumbnailUpdate();
+      return;
+    }
 
     // Render only dirty rectangles when coverage is small enough.
     let dirtyPixels = 0;
@@ -407,16 +471,10 @@ function pushTabThumbnail(): void {
 function onResize(w: number, h: number): void {
   canvas.width  = w;
   canvas.height = h;
-  requestResizeToViewport();
+  postDebug(`[Render] onResize remote=${w}x${h}`);
 
-  // Stop connect-time retries once the remote desktop matches local viewport.
-  const main = document.getElementById("main") as HTMLElement | null;
-  if (main) {
-    const { width: viewportWidth, height: viewportHeight } = getPaintableViewportSize(main, canvas);
-    if (w === viewportWidth && h === viewportHeight) {
-      stopInitialResizeRetry();
-    }
-  }
+  // Stop connect-time retries once the first remote resize has arrived.
+  stopInitialResizeRetry();
 }
 
 function stopInitialResizeRetry(): void {
@@ -452,6 +510,7 @@ function startInitialResizeRetry(): void {
 
 function requestResizeToViewport(): void {
   if (!client || !connected) return;
+  if (!ENABLE_REMOTE_RESIZE) return;
   const main = document.getElementById("main") as HTMLElement | null;
   if (!main) return;
   const { width: viewportWidth, height: viewportHeight } = getPaintableViewportSize(main, canvas);
@@ -593,14 +652,54 @@ function getVsCodeApi(): { postMessage(msg: unknown): void } | undefined {
 class VsCodeTransport {
   readyState = 0; // CONNECTING
   binaryType = "arraybuffer";
-  onopen:    ((ev: Event) => void) | null = null;
-  onmessage: ((ev: MessageEvent<ArrayBuffer>) => void) | null = null;
-  onclose:   ((ev: CloseEvent) => void) | null = null;
-  onerror:   ((ev: Event) => void) | null = null;
+
+  private _onopen: ((ev: Event) => void) | null = null;
+  private _onmessage: ((ev: MessageEvent<ArrayBuffer>) => void) | null = null;
+  private _onclose: ((ev: CloseEvent) => void) | null = null;
+  private _onerror: ((ev: Event) => void) | null = null;
+
+  set onopen(handler: ((ev: Event) => void) | null) {
+    this._onopen = handler;
+    this.flushPendingEvents();
+  }
+
+  get onopen(): ((ev: Event) => void) | null {
+    return this._onopen;
+  }
+
+  set onmessage(handler: ((ev: MessageEvent<ArrayBuffer>) => void) | null) {
+    this._onmessage = handler;
+    this.flushPendingEvents();
+  }
+
+  get onmessage(): ((ev: MessageEvent<ArrayBuffer>) => void) | null {
+    return this._onmessage;
+  }
+
+  set onclose(handler: ((ev: CloseEvent) => void) | null) {
+    this._onclose = handler;
+    this.flushPendingEvents();
+  }
+
+  get onclose(): ((ev: CloseEvent) => void) | null {
+    return this._onclose;
+  }
+
+  set onerror(handler: ((ev: Event) => void) | null) {
+    this._onerror = handler;
+    this.flushPendingEvents();
+  }
+
+  get onerror(): ((ev: Event) => void) | null {
+    return this._onerror;
+  }
 
   private sessionId: string | null = null;
   private readonly api: { postMessage(msg: unknown): void };
   private readonly msgHandler: (ev: MessageEvent) => void;
+  private pendingOpen = false;
+  private pendingMessages: ArrayBuffer[] = [];
+  private pendingCloseReason: string | null = null;
 
   constructor(host: string, port: number) {
     this.api = getVsCodeApi()!;
@@ -611,23 +710,47 @@ class VsCodeTransport {
       if (msg["type"] === "tcp:connected" && this.sessionId === null) {
         this.sessionId = msg["sessionId"] as string;
         this.readyState = 1; // OPEN
-        this.onopen?.(new Event("open"));
+        this.pendingOpen = true;
+        this.flushPendingEvents();
       } else if (msg["type"] === "tcp:data" && msg["sessionId"] === this.sessionId) {
         // Decode base64 payload to ArrayBuffer
         const b64 = msg["payloadBase64"] as string;
         const binary = atob(b64);
         const buf = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
-        this.onmessage?.(new MessageEvent("message", { data: buf.buffer }));
+        this.pendingMessages.push(buf.buffer);
+        this.flushPendingEvents();
       } else if (
         (msg["type"] === "tcp:closed" || msg["type"] === "tcp:error") &&
         msg["sessionId"] === this.sessionId
       ) {
-        this._close(msg["type"] === "tcp:error" ? "TCP error" : String(msg["reason"] ?? ""));
+        this.pendingCloseReason = msg["type"] === "tcp:error" ? "TCP error" : String(msg["reason"] ?? "");
+        this.flushPendingEvents();
       }
     };
     window.addEventListener("message", this.msgHandler);
     this.api.postMessage({ type: "connect", host, port });
+  }
+
+  private flushPendingEvents(): void {
+    if (this.pendingOpen && this._onopen) {
+      this.pendingOpen = false;
+      this._onopen(new Event("open"));
+    }
+
+    if (this._onmessage && this.pendingMessages.length > 0) {
+      const queued = this.pendingMessages;
+      this.pendingMessages = [];
+      for (const data of queued) {
+        this._onmessage(new MessageEvent("message", { data }));
+      }
+    }
+
+    if (this.pendingCloseReason !== null && this._onclose) {
+      const reason = this.pendingCloseReason;
+      this.pendingCloseReason = null;
+      this._close(reason);
+    }
   }
 
   send(data: string | ArrayBuffer | ArrayBufferView): void {
@@ -661,7 +784,7 @@ class VsCodeTransport {
   private _close(reason: string): void {
     this.readyState = 3; // CLOSED
     window.removeEventListener("message", this.msgHandler);
-    this.onclose?.(new CloseEvent("close", { code: 1000, reason, wasClean: true }));
+    this._onclose?.(new CloseEvent("close", { code: 1000, reason, wasClean: true }));
   }
 }
 
@@ -682,6 +805,10 @@ function buildUrl(): string | null {
   if (!Number.isInteger(proxyPort) || proxyPort <= 0) { setStatus("Invalid proxy port"); return null; }
   const encodedHost = encodeURIComponent(host);
   return `ws://localhost:${proxyPort}?host=${encodedHost}&port=${vncPort}`;
+}
+
+function postDebug(msg: string): void {
+  getVsCodeApi()?.postMessage({ type: "vnc:debug", message: msg });
 }
 
 function doConnect(): void {
@@ -723,6 +850,7 @@ function doConnect(): void {
     onClipboard: onRemoteClipboard,
     onCursor: onRemoteCursor,
     onStatus: setStatus,
+    onLog: postDebug,
     onDisconnect(reason) {
       setStatus(`Disconnected: ${reason}`);
       setConnected(false);
@@ -735,9 +863,11 @@ function doConnect(): void {
   setConnected(true);
   client.connect();
   updateVisibilityRefreshPolicy();
-  // Request an initial remote resize and retry briefly while capability/state settles.
-  window.setTimeout(requestResizeToViewport, 0);
-  startInitialResizeRetry();
+  if (ENABLE_REMOTE_RESIZE) {
+    // Request an initial remote resize and retry briefly while capability/state settles.
+    window.setTimeout(requestResizeToViewport, 0);
+    startInitialResizeRetry();
+  }
 }
 
 function doDisconnect(): void {
@@ -893,6 +1023,7 @@ function init(): void {
   
   const handleViewportResize = () => {
     if (!client || !connected) return;
+    if (!ENABLE_REMOTE_RESIZE) return;
     // Debounce resize to avoid spamming updates
     if (resizeTimeout !== null) clearTimeout(resizeTimeout);
     resizeTimeout = window.setTimeout(() => {

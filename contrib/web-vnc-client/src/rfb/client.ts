@@ -25,6 +25,7 @@ import { ZrleDecoder } from "../codecs/zrle";
 import { TightDecoder } from "../codecs/tight";
 import { warmUpWasm } from "../codecs/tightInflateBackend";
 import { applyH264, resetAllH264Contexts } from "../codecs/h264";
+import NonH264DecodeWorker from "./nonH264DecodeWorker?worker&inline";
 
 // ── RFB message / encoding constants ────────────────────────────────────────
 
@@ -139,6 +140,8 @@ export interface RfbClientOptions {
   onCursor?: (cursorCss: string) => void;
   /** Preferred encoding policy for SetEncodings negotiation. */
   encodingMode?: RfbEncodingMode;
+  /** Called with debug/diagnostic log lines (worker init, fallback events, etc.). */
+  onLog?: (msg: string) => void;
 }
 
 export interface RfbClientStats {
@@ -153,6 +156,7 @@ export interface RfbClientStats {
   tightWorkerBreakdown: string;
   workerQueueDepth: number;
   bottleneckHint: "server-limited" | "client-limited" | "balanced";
+  workerFallbackActive?: boolean;
 }
 
 export type RfbEncodingMode = "auto" | "h264" | "tight" | "zrle" | "hextile" | "raw";
@@ -220,10 +224,17 @@ export class RfbClient {
   // regardless of what the caller requests, then reset the flag.
   private pendingFullRefresh = false;
   private pendingPostConnectTightRefresh = false;
+  // Startup recovery: some servers initially send only pseudo-rect updates
+  // (cursor/desktop-size) without drawable pixel data.
+  private hasSeenDrawableRect = false;
+  private startupForcedFullRefreshes = 0;
+  private static readonly STARTUP_MAX_FORCED_FULL_REFRESHES = 8;
 
   // Encoding mode switch requested externally while a FBU was in progress.
   // Applied between complete FBUs to avoid corrupting stateful inflate streams.
   private pendingEncodingMode: RfbEncodingMode | null = null;
+  private lastEncodingModeSwitchAt = 0;
+  private decodeResyncAttemptsAfterSwitch = 0;
 
   // Frame timing optimization: adaptive request frequency
   private frameRequestTime: number | null = null;
@@ -237,6 +248,11 @@ export class RfbClient {
   // Worker pool for non-H.264 decode to reduce main-thread CPU load.
   private nonH264Workers: Worker[] = [];
   private nonH264WorkerReady = false;
+  private nonH264WorkerInitAttempted = false;
+  private nonH264WorkerInitFailed = false;
+  private nonH264WorkerUnavailable = false;
+  private nonH264FallbackActive = false;
+  private nonH264FallbackLogged = false;
   private nextNonH264Worker = 0;
   private workerReqId = 1;
   private workerPending = new Map<number, {
@@ -253,6 +269,9 @@ export class RfbClient {
     this.aborted = false;
     this.disconnectReason = null;
     this.pendingPostConnectTightRefresh = false;
+    this.nonH264FallbackActive = false;
+    this.nonH264FallbackLogged = false;
+    this.nonH264WorkerUnavailable = false;
     this.opts.onStatus?.("Connecting…");
 
     void warmUpWasm().then(() => {
@@ -310,12 +329,16 @@ export class RfbClient {
 
   private ensureNonH264Worker(): void {
     if (this.nonH264Workers.length > 0 || this.nonH264WorkerReady) return;
+    this.nonH264WorkerInitAttempted = true;
+    this.opts.onLog?.(`[Worker] ensureNonH264Worker: starting init`);
     try {
       const cpuCount = typeof navigator !== "undefined" ? (navigator.hardwareConcurrency ?? 2) : 2;
       const workerCount = Math.max(1, Math.min(4, cpuCount - 1));
+      this.opts.onLog?.(`[Worker] cpuCount=${cpuCount} workerCount=${workerCount}`);
 
       for (let i = 0; i < workerCount; i += 1) {
-        const worker = new Worker(new URL("./nonH264DecodeWorker.ts", import.meta.url), { type: "module" });
+        this.opts.onLog?.(`[Worker] spawning worker[${i}] inline`);
+        const worker = new NonH264DecodeWorker();
         worker.onmessage = (ev: MessageEvent<NonH264DecodeResponse>) => {
           const msg = ev.data;
           const pending = this.workerPending.get(msg.id);
@@ -332,21 +355,41 @@ export class RfbClient {
           }
         };
         worker.onerror = (ev: ErrorEvent) => {
-          const err = ev.error ?? new Error(ev.message || "Decode worker error");
+          const errMsg = ev.message || String(ev.error) || "Decode worker error";
+          const details = [
+            `message: ${errMsg}`,
+            `filename: ${ev.filename || "?"}`,
+            `lineno: ${ev.lineno || "?"}`,
+            `colno: ${ev.colno || "?"}`,
+            `error: ${ev.error ? String(ev.error) : "?"}`,
+          ].join(", ");
+          this.opts.onLog?.(`[Worker] onerror: ${details}`);
+          const err = ev.error ?? new Error(errMsg);
           for (const [, pending] of this.workerPending) {
             pending.reject(err);
           }
           this.workerPending.clear();
+          this.disableNonH264Workers(errMsg);
         };
         this.nonH264Workers.push(worker);
       }
 
       this.nonH264WorkerReady = this.nonH264Workers.length > 0;
+      this.nonH264WorkerInitFailed = !this.nonH264WorkerReady;
       this.nextNonH264Worker = 0;
-    } catch {
+      this.opts.onLog?.(`[Worker] init complete: ready=${this.nonH264WorkerReady} count=${this.nonH264Workers.length} initFailed=${this.nonH264WorkerInitFailed}`);
+    } catch (e) {
       // Fallback to local decode path when Worker is unavailable.
+      const errMsg = e instanceof Error ? e.message : String(e);
+      this.opts.onLog?.(`[Worker] init threw exception: ${errMsg}`);
+      const unavailable = /cannot be accessed from origin|failed to construct\s+'?worker'?|content security policy|csp/i.test(errMsg);
+      this.nonH264WorkerUnavailable = unavailable;
+      if (unavailable) {
+        this.opts.onLog?.("[Worker] unavailable in current webview origin; keeping main-thread decode without fallback warning");
+      }
       this.nonH264Workers = [];
       this.nonH264WorkerReady = false;
+      this.nonH264WorkerInitFailed = true;
       this.nextNonH264Worker = 0;
     }
   }
@@ -362,6 +405,14 @@ export class RfbClient {
       pending.reject(new Error("Decode worker shutdown"));
     }
     this.workerPending.clear();
+  }
+
+  private disableNonH264Workers(reason: string): void {
+    this.opts.onLog?.(`[Worker] disabling worker path: ${reason}`);
+    this.nonH264WorkerUnavailable = false;
+    this.nonH264FallbackActive = true;
+    this.nonH264WorkerInitFailed = true;
+    this.shutdownNonH264Worker();
   }
 
   private resetNonH264StatefulWorkers(): void {
@@ -392,7 +443,14 @@ export class RfbClient {
     this.nextNonH264Worker = (this.nextNonH264Worker + 1) % statelessCount;
     return new Promise<DecodedPatch>((resolve, reject) => {
       this.workerPending.set(id, { resolve, reject });
-      worker.postMessage(request, [request.payload]);
+      try {
+        worker.postMessage(request, [request.payload]);
+      } catch (e) {
+        this.workerPending.delete(id);
+        const errMsg = e instanceof Error ? e.message : String(e);
+        this.disableNonH264Workers(`postMessage failed (stateless): ${errMsg}`);
+        reject(new Error(errMsg));
+      }
     });
   }
 
@@ -409,7 +467,14 @@ export class RfbClient {
     const worker = this.nonH264Workers[0]!;
     return new Promise<DecodedPatch>((resolve, reject) => {
       this.workerPending.set(id, { resolve, reject });
-      worker.postMessage(request, [request.payload]);
+      try {
+        worker.postMessage(request, [request.payload]);
+      } catch (e) {
+        this.workerPending.delete(id);
+        const errMsg = e instanceof Error ? e.message : String(e);
+        this.disableNonH264Workers(`postMessage failed (stateful): ${errMsg}`);
+        reject(new Error(errMsg));
+      }
     });
   }
 
@@ -431,6 +496,10 @@ export class RfbClient {
     msg[6] = (keysym >>> 8) & 0xff;
     msg[7] = keysym & 0xff;
     this.send(msg);
+  }
+
+  isWorkerFallbackActive(): boolean {
+    return this.nonH264FallbackActive;
   }
 
   /** Send a pointer (mouse) event to the server. */
@@ -626,12 +695,15 @@ export class RfbClient {
   }
 
   private applyEncodingMode(mode: RfbEncodingMode): void {
+    if (this.encodingMode === mode) {
+      return;
+    }
     this.encodingMode = mode;
-    // Reset decoder state so the new stream gets a clean handshake.
-    this.tight.reset();
-    this.zrle.reset();
-    resetAllH264Contexts();
-    this.resetNonH264StatefulWorkers();
+    // Preserve stateful decoder history across live mode switches.
+    // Tight/ZRLE streams are persistent, and aggressive resets here can
+    // desynchronize inflate windows and produce "invalid distance" failures.
+    this.lastEncodingModeSwitchAt = Date.now();
+    this.decodeResyncAttemptsAfterSwitch = 0;
     if (this.ws?.readyState === /* OPEN */ 1) {
       this.sendSetEncodings();
       // Signal the main loop to send a non-incremental FBU on its next cycle
@@ -652,6 +724,31 @@ export class RfbClient {
     this.stopStatsTimer();
     this.disconnectReason = reason;
     this.opts.onDisconnect?.(reason);
+  }
+
+  private shouldAttemptDecodeResync(msg: string): boolean {
+    const recentlySwitched = (Date.now() - this.lastEncodingModeSwitchAt) < 5000;
+    if (!recentlySwitched) {
+      return false;
+    }
+    if (this.decodeResyncAttemptsAfterSwitch >= 1) {
+      return false;
+    }
+    const lower = msg.toLowerCase();
+    return lower.includes("invalid distance")
+      || lower.includes("inflate")
+      || lower.includes("zlib");
+  }
+
+  private performDecodeResyncAfterSwitch(msg: string): void {
+    this.decodeResyncAttemptsAfterSwitch += 1;
+    this.opts.onLog?.(`[Render/RFB] decode resync after mode switch: ${msg}`);
+    this.tight.reset();
+    this.zrle.reset();
+    resetAllH264Contexts();
+    this.resetNonH264StatefulWorkers();
+    this.pendingFullRefresh = true;
+    this.sendFbUpdateRequest(false, 0, 0, this.fbWidth, this.fbHeight);
   }
 
   private async runProtocol(): Promise<void> {
@@ -745,8 +842,8 @@ export class RfbClient {
       }
     }
 
-    // 6. ClientInit (shared = 0 so this session requests exclusive access)
-    this.send(new Uint8Array([0]));
+    // 6. ClientInit (shared = 1 for broader server compatibility)
+    this.send(new Uint8Array([1]));
 
     // 7. ServerInit: width(2) + height(2) + pixel-format(16) + name-length(4) + name
     const serverInitHdr = await this.reader.read(24);
@@ -813,6 +910,9 @@ export class RfbClient {
 
     // Reset dirty rects for this frame
     this.dirtyRects = [];
+    this.nonH264FallbackActive = false;
+    let drawableRectsThisFrame = 0;
+    let sawResizePseudoRectThisFrame = false;
 
     let frameWorkerDecodeMs = 0;
     let frameBlitMs = 0;
@@ -849,6 +949,29 @@ export class RfbClient {
       const w   = readU16(rectHdr, 4);
       const h   = readU16(rectHdr, 6);
       const enc = readS32(rectHdr, 8);
+
+      if (enc === ENC_RAW || enc === ENC_COPYRECT || enc === ENC_HEXTILE || enc === ENC_ZRLE || enc === ENC_TIGHT || enc === ENC_H264) {
+        drawableRectsThisFrame += 1;
+      } else if (enc === ENC_DESKTOP_SIZE || enc === ENC_EXTENDED_DESKTOP_SIZE) {
+        sawResizePseudoRectThisFrame = true;
+      }
+
+      // Only surface fallback when main-thread decode is actually used
+      // for non-H264 rectangle types.
+      if (!this.nonH264WorkerReady && (enc === ENC_RAW || enc === ENC_HEXTILE || enc === ENC_ZRLE || enc === ENC_TIGHT)) {
+        if (this.nonH264WorkerUnavailable) {
+          if (!this.nonH264FallbackLogged) {
+            this.opts.onLog?.(`[Worker] worker unavailable for this webview origin; using main-thread decode enc=${enc}`);
+            this.nonH264FallbackLogged = true;
+          }
+        } else {
+          if (!this.nonH264FallbackLogged) {
+            this.opts.onLog?.(`[Worker] fallback triggered: nonH264WorkerReady=false enc=${enc} initAttempted=${this.nonH264WorkerInitAttempted} initFailed=${this.nonH264WorkerInitFailed} workerCount=${this.nonH264Workers.length}`);
+            this.nonH264FallbackLogged = true;
+          }
+          this.nonH264FallbackActive = true;
+        }
+      }
 
       // Parallelize decodable rects off the main thread.
       // Stateless (RAW, HEXTILE): round-robin across all workers.
@@ -897,6 +1020,14 @@ export class RfbClient {
       await flushParallelRects();
     }
 
+    if (drawableRectsThisFrame > 0) {
+      if (!this.hasSeenDrawableRect) {
+        this.opts.onLog?.(`[Render/RFB] first drawable frame arrived: numRects=${numRects} drawableRects=${drawableRectsThisFrame}`);
+      }
+      this.hasSeenDrawableRect = true;
+      this.startupForcedFullRefreshes = 0;
+    }
+
     // Commit frame to canvas with dirty rect information
     if (this.opts.onFrameWithDirtyRects) {
       this.opts.onFrameWithDirtyRects(this.imageData, this.dirtyRects);
@@ -904,8 +1035,8 @@ export class RfbClient {
       this.opts.onFrame?.(this.imageData);
     }
 
-    // Fallback path if resize capability has not been explicitly discovered.
-    this.maybeAttemptOptimisticResize();
+    // Do not send optimistic ClientSetDesktopSize probes: some servers close
+    // the session when receiving unsupported desktop-resize messages.
 
     const frameMs = performance.now() - decodeStart;
     this.frameMsWindow += frameMs;
@@ -924,6 +1055,23 @@ export class RfbClient {
     if (this.pendingPostConnectTightRefresh) {
       this.pendingPostConnectTightRefresh = false;
       this.sendFbUpdateRequest(false, 0, 0, this.fbWidth, this.fbHeight);
+    } else if (!this.hasSeenDrawableRect && numRects > 0 && drawableRectsThisFrame === 0) {
+      // Recovery path for startup: request a bounded number of full updates.
+      // Resize-only pseudo frames can loop forever on some servers if we force
+      // full refresh on every iteration.
+      this.startupForcedFullRefreshes += 1;
+      if (sawResizePseudoRectThisFrame) {
+        this.opts.onLog?.(`[Render/RFB] pseudo-only startup frame: numRects=${numRects}; resize-only pseudo detected, waiting for drawable update`);
+        this.sendAdaptiveFramebufferUpdateRequest();
+      } else if (this.startupForcedFullRefreshes <= RfbClient.STARTUP_MAX_FORCED_FULL_REFRESHES) {
+        this.opts.onLog?.(`[Render/RFB] pseudo-only startup frame: numRects=${numRects}; forcing full refresh #${this.startupForcedFullRefreshes}`);
+        this.sendFbUpdateRequest(false, 0, 0, this.fbWidth, this.fbHeight);
+      } else {
+        if (this.startupForcedFullRefreshes === RfbClient.STARTUP_MAX_FORCED_FULL_REFRESHES + 1) {
+          this.opts.onLog?.("[Render/RFB] startup pseudo-only refresh cap reached; switching to incremental requests");
+        }
+        this.sendAdaptiveFramebufferUpdateRequest();
+      }
     } else {
       // Request the next update only after any pending encoding switch has been
       // applied at this message boundary.
@@ -931,6 +1079,11 @@ export class RfbClient {
     }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (this.shouldAttemptDecodeResync(msg)) {
+        this.opts.onStatus?.(`Decode resync in progress: ${msg}`);
+        this.performDecodeResyncAfterSwitch(msg);
+        return;
+      }
       // A decode failure inside FramebufferUpdate can leave unread rectangles
       // in the current server message. Because some encodings are not
       // length-delimited on the wire, we cannot reliably resync in-place.
@@ -1062,14 +1215,18 @@ export class RfbClient {
     }
 
     if (enc === ENC_DESKTOP_SIZE) {
-      this.fbWidth  = w;
-      this.fbHeight = h;
-      this.allocateFramebuffer(w, h);
-      // Keep ZRLE/Tight zlib history across DesktopSize. Some servers continue
-      // the same stream after resize, and resetting here causes inflate
-      // failures like "invalid distance".
-      resetAllH264Contexts();
-      this.opts.onResize?.(w, h);
+      const sizeChanged = this.fbWidth !== w || this.fbHeight !== h;
+      if (sizeChanged) {
+        this.fbWidth  = w;
+        this.fbHeight = h;
+        this.allocateFramebuffer(w, h);
+        // Keep ZRLE/Tight zlib history across DesktopSize. Some servers continue
+        // the same stream after resize, and resetting here causes inflate
+        // failures like "invalid distance".
+        resetAllH264Contexts();
+        this.pendingFullRefresh = true;
+        this.opts.onResize?.(w, h);
+      }
       this.pendingRemoteResize = false;
       this.clearResizeAckTimeout();
       this.flushQueuedRemoteResize();
@@ -1096,13 +1253,17 @@ export class RfbClient {
         return;
       }
 
-      this.fbWidth = w;
-      this.fbHeight = h;
-      this.allocateFramebuffer(w, h);
-      // Keep ZRLE/Tight zlib history across ExtendedDesktopSize for stream
-      // continuity (servers may continue the same compressed stream).
-      resetAllH264Contexts();
-      this.opts.onResize?.(w, h);
+      const sizeChanged = this.fbWidth !== w || this.fbHeight !== h;
+      if (sizeChanged) {
+        this.fbWidth = w;
+        this.fbHeight = h;
+        this.allocateFramebuffer(w, h);
+        // Keep ZRLE/Tight zlib history across ExtendedDesktopSize for stream
+        // continuity (servers may continue the same compressed stream).
+        resetAllH264Contexts();
+        this.pendingFullRefresh = true;
+        this.opts.onResize?.(w, h);
+      }
 
       // Treat any ExtendedDesktopSize update as an acknowledgement boundary.
       this.pendingRemoteResize = false;
@@ -1336,12 +1497,12 @@ export class RfbClient {
     encs.push(
       ENC_COPYRECT,
       ENC_RAW,
-      ENC_DESKTOP_SIZE,
       ENC_CURSOR,
       ENC_EXTENDED_DESKTOP_SIZE,
     );
 
     const uniqueEncs = [...new Set(encs)];
+    this.opts.onLog?.(`[RFB] SetEncodings: ${uniqueEncs.join(",")}`);
 
     const msg = new Uint8Array(4 + uniqueEncs.length * 4);
     msg[0] = 2; // SetEncodings
@@ -1476,6 +1637,7 @@ export class RfbClient {
       tightWorkerBreakdown: this.lastTightWorkerBreakdown,
       workerQueueDepth,
       bottleneckHint,
+      workerFallbackActive: this.isWorkerFallbackActive(),
     });
   }
 }
@@ -1510,9 +1672,9 @@ function encodingName(enc: number): string {
 function preferredEncodingsForMode(mode: RfbEncodingMode): number[] {
   switch (mode) {
     case "h264":
-      return [ENC_H264];
+      return [ENC_HEXTILE, ENC_ZRLE, ENC_H264];
     case "tight":
-      return [ENC_TIGHT];
+      return [ENC_HEXTILE, ENC_ZRLE, ENC_TIGHT];
     case "zrle":
       return [ENC_ZRLE];
     case "hextile":

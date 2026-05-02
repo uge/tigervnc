@@ -172,7 +172,7 @@ class SavedEndpointsProvider {
             ];
             if (!snap?.connected)
                 return overrideItems;
-            return [
+            const statsItems = [
                 ...overrideItems,
                 new StatItem(element.endpoint.id, "protocol", "Protocol", snap.protocol),
                 new StatItem(element.endpoint.id, "autoProtocol", "Auto", snap.autoProtocol),
@@ -188,6 +188,13 @@ class SavedEndpointsProvider {
                 new StatItem(element.endpoint.id, "bottleneckHint", "Bottleneck", snap.bottleneckHint),
                 new StatItem(element.endpoint.id, "status", "Status", snap.status),
             ];
+            if (snap.inflateBackend === "fflate") {
+                statsItems.push(new StatItem(element.endpoint.id, "fallback-inflate", "Zlib", "JavaScript fallback"));
+            }
+            if (snap.workerFallbackActive) {
+                statsItems.push(new StatItem(element.endpoint.id, "fallback-worker", "Decode worker", "Main-thread fallback"));
+            }
+            return statsItems;
         }
         return [];
     }
@@ -299,6 +306,9 @@ function iconForStat(key) {
             return "warning";
         case "status":
             return "info";
+        case "fallback-inflate":
+        case "fallback-worker":
+            return "warning";
         default:
             return "circle-small-filled";
     }
@@ -509,6 +519,7 @@ function activate(context) {
                 latencyMs: 0,
                 fps: 0,
                 bottleneckHint: "balanced",
+                workerFallbackActive: false,
                 ...previous,
                 ...patch,
                 lastUpdated: Date.now(),
@@ -624,11 +635,16 @@ function activate(context) {
                     latencyMs: msg.stats.latencyMs,
                     fps: msg.stats.fps ?? 0,
                     bottleneckHint: msg.stats.bottleneckHint,
+                    inflateBackend: msg.stats.inflateBackend,
+                    workerFallbackActive: msg.stats.workerFallbackActive ?? false,
                 }, SIDEBAR_STATS_REFRESH_MS);
             }
             else if (msg.type === "vnc:status") {
                 output.appendLine(`[VNC] Webview status: ${msg.message}`);
                 updateSnapshot({ status: msg.message });
+            }
+            else if (msg.type === "vnc:debug") {
+                output.appendLine(`[VNC][DBG] ${msg.message}`);
             }
             else if (msg.type === "vnc:openSettings") {
                 output.appendLine("[VNC] Webview requested settings");

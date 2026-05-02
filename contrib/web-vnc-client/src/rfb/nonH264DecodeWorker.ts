@@ -2,6 +2,24 @@ import { applyHextile } from "../codecs/hextile";
 import { ZrleDecoder } from "../codecs/zrle";
 import { TightDecoder, type TightProfileSample } from "../codecs/tight";
 
+// Report any errors that occur during module initialization
+if (typeof globalThis !== 'undefined') {
+  const origError = (globalThis as any).console?.error;
+  const postWorkerError = (msg: string) => {
+    try {
+      (self as unknown as Worker).postMessage({ type: "init-error", message: msg });
+    } catch (e) {
+      // Ignore if postMessage fails
+    }
+  };
+  if (origError) {
+    (globalThis as any).console.error = (...args: any[]) => {
+      origError(...args);
+      postWorkerError(String(args[0]));
+    };
+  }
+}
+
 const ENC_RAW = 0;
 const ENC_HEXTILE = 5;
 const ENC_ZRLE = 16;

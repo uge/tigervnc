@@ -232,6 +232,11 @@ export function warmUpWasm(): Promise<boolean> {
   return startRuntimeInit();
 }
 
+export function getInflateBackendStatus(): "wasm" | "fflate" | null {
+  if (!runtimeInitStarted) return null;
+  return runtimeReady ? "wasm" : "fflate";
+}
+
 startRuntimeInit();
 
 export class TightInflateStream {
