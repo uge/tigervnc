@@ -473,7 +473,20 @@ export function activate(context: vscode.ExtensionContext): void {
     () => endpoints,
     (endpointId) => connectionsByEndpointId.get(endpointId)
   );
-  context.subscriptions.push(vscode.window.registerTreeDataProvider("tigervncVscode.savedEndpoints", provider));
+  const treeView = vscode.window.createTreeView("tigervncVscode.savedEndpoints", {
+    treeDataProvider: provider,
+  });
+  context.subscriptions.push(treeView);
+
+  const updateBadge = (): void => {
+    let activeCount = 0;
+    for (const snapshot of connectionsByEndpointId.values()) {
+      if (snapshot.connected) activeCount++;
+    }
+    treeView.badge = activeCount > 0
+      ? { value: activeCount, tooltip: `${activeCount} active connection${activeCount > 1 ? "s" : ""}` }
+      : undefined;
+  };
 
   const endpointKeyFor = (host: string, port: number): string => `${host.trim().toLowerCase()}:${port}`;
 
@@ -688,6 +701,9 @@ export function activate(context: vscode.ExtensionContext): void {
           lastUpdated: Date.now(),
         };
         connectionsByEndpointId.set(currentSnapshotKey, next);
+        if (patch.connected !== undefined && patch.connected !== previous?.connected) {
+          updateBadge();
+        }
         if (!endpointId) return;
         if (throttleMs > 0) {
           scheduleSidebarRefresh(currentSnapshotKey, throttleMs);
