@@ -837,7 +837,19 @@ export function activate(context: vscode.ExtensionContext): void {
         if (panelState.activeThumbnailPath) {
           void rm(panelState.activeThumbnailPath, { force: true });
         }
-        updateSnapshot({ connected: false, status: "Panel closed" });
+        // Remove snapshot for ad-hoc connections, update for saved endpoints
+        if (!endpointId) {
+          connectionsByEndpointId.delete(currentSnapshotKey);
+        } else {
+          connectionsByEndpointId.set(currentSnapshotKey, {
+            ...connectionsByEndpointId.get(currentSnapshotKey),
+            connected: false,
+            status: "Panel closed",
+            lastUpdated: Date.now(),
+          } as ConnectionSnapshot);
+          provider.refresh(provider.getEndpointItemById(endpointId));
+        }
+        updateBadge();
       });
 
       panel.onDidChangeViewState((event) => {
