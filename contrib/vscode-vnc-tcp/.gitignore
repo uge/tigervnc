@@ -1,0 +1,9 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+out/
+*.vsix
+
+# Synced client assets (regenerated from web-vnc-client)
+media/client-dist/
