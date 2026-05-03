@@ -73,8 +73,14 @@ export class TcpSession {
     if (!this.socket) {
       return;
     }
-    this.socket.end();
-    this.socket.destroy();
+    const socket = this.socket;
     this.socket = null;
+    socket.removeAllListeners();
+    try {
+      socket.end();
+    } catch {
+      // end() may throw on already-errored sockets; destroy() below handles cleanup
+    }
+    socket.destroy();
   }
 }

@@ -169,11 +169,24 @@ function el<T extends HTMLElement>(id: string): T {
 
 function setStatus(msg: string): void {
   el("status").textContent = msg;
+  const placeholderStatus = document.getElementById("placeholder-status");
+  if (placeholderStatus) {
+    placeholderStatus.textContent = msg;
+  }
   getVsCodeApi()?.postMessage({ type: "vnc:status", message: msg });
 
   // Reset modifier keys when connection is established to clear any stuck state.
   if (msg === "Connected") {
+    if (!connected) {
+      setConnected(true);
+    }
     resetModifierKeys();
+    // Send initial desktop resize now that the connection is live.
+    // The setTimeout(0) at connect time races with the async handshake
+    // and often fires before `connected` is true, so this is the reliable trigger.
+    if (ENABLE_REMOTE_RESIZE) {
+      requestResizeToViewport();
+    }
   }
 }
 
@@ -320,16 +333,7 @@ function setConnected(state: boolean): void {
     isConnecting = false;
   }
   getVsCodeApi()?.postMessage({ type: "vnc:connectedState", connected: state });
-  el<HTMLButtonElement>("btn-connect").textContent = state ? "Disconnect" : "Connect";
-  el<HTMLButtonElement>("btn-connect").classList.toggle("connected", state);
-  // Disable all input fields while connected
-  for (const id of ["input-url", "input-password", "input-vnc-host", "input-vnc-port", "input-proxy-port"]) {
-    const inp = document.getElementById(id) as HTMLInputElement | null;
-    if (inp) inp.disabled = state;
-  }
-  for (const btn of document.querySelectorAll<HTMLButtonElement>(".mode-btn")) {
-    btn.disabled = state;
-  }
+  updateConnectionControls();
   // Enable/disable clipboard toggle based on connection state
   const clipboardToggle = el<HTMLInputElement>("clipboard-toggle");
   clipboardToggle.checked = clipboardEnabled;
@@ -356,9 +360,23 @@ function setConnected(state: boolean): void {
   }
 }
 
+function updateConnectionControls(): void {
+  const busy = connected || isConnecting;
+  const button = el<HTMLButtonElement>("btn-connect");
+  button.textContent = connected ? "Disconnect" : isConnecting ? "Connecting..." : "Connect";
+  button.classList.toggle("connected", connected);
+  for (const id of ["input-url", "input-password", "input-vnc-host", "input-vnc-port", "input-proxy-port"]) {
+    const inp = document.getElementById(id) as HTMLInputElement | null;
+    if (inp) inp.disabled = busy;
+  }
+  for (const btn of document.querySelectorAll<HTMLButtonElement>(".mode-btn")) {
+    btn.disabled = busy;
+  }
+}
+
 function updateConnectionSurface(): void {
   const showCanvas = connected && hasRenderedFirstFrame;
-  const showPlaceholder = !connected && !isConnecting;
+  const showPlaceholder = !showCanvas;
   canvas.style.display = showCanvas ? "block" : "none";
   el("placeholder").style.display = showPlaceholder ? "flex" : "none";
 
@@ -774,6 +792,13 @@ class VsCodeTransport {
   private _onmessage: ((ev: MessageEvent<ArrayBuffer>) => void) | null = null;
   private _onclose: ((ev: CloseEvent) => void) | null = null;
   private _onerror: ((ev: Event) => void) | null = null;
+  private sessionId: string | null = null;
+  private pendingSessionId: string | null = null;
+  private readonly api: { postMessage(msg: unknown): void };
+  private readonly msgHandler: (ev: MessageEvent) => void;
+  private pendingOpen = false;
+  private pendingMessages: ArrayBuffer[] = [];
+  private pendingCloseReason: string | null = null;
 
   set onopen(handler: ((ev: Event) => void) | null) {
     this._onopen = handler;
@@ -811,21 +836,21 @@ class VsCodeTransport {
     return this._onerror;
   }
 
-  private sessionId: string | null = null;
-  private readonly api: { postMessage(msg: unknown): void };
-  private readonly msgHandler: (ev: MessageEvent) => void;
-  private pendingOpen = false;
-  private pendingMessages: ArrayBuffer[] = [];
-  private pendingCloseReason: string | null = null;
-
   constructor(host: string, port: number) {
     this.api = getVsCodeApi()!;
     this.msgHandler = (ev: MessageEvent) => {
       const msg = ev.data as Record<string, unknown>;
       if (!msg || typeof msg !== "object") return;
 
-      if (msg["type"] === "tcp:connected" && this.sessionId === null) {
+      if (msg["type"] === "tcp:connecting" && this.pendingSessionId === null) {
+        this.pendingSessionId = msg["sessionId"] as string;
+      } else if (
+        msg["type"] === "tcp:connected"
+        && this.sessionId === null
+        && (this.pendingSessionId === null || msg["sessionId"] === this.pendingSessionId)
+      ) {
         this.sessionId = msg["sessionId"] as string;
+        this.pendingSessionId = this.sessionId;
         this.readyState = 1; // OPEN
         this.pendingOpen = true;
         this.flushPendingEvents();
@@ -837,11 +862,19 @@ class VsCodeTransport {
         for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
         this.pendingMessages.push(buf.buffer);
         this.flushPendingEvents();
-      } else if (
-        (msg["type"] === "tcp:closed" || msg["type"] === "tcp:error") &&
-        msg["sessionId"] === this.sessionId
-      ) {
-        this.pendingCloseReason = msg["type"] === "tcp:error" ? "TCP error" : String(msg["reason"] ?? "");
+      } else if (msg["type"] === "tcp:closed" || msg["type"] === "tcp:error") {
+        const msgSessionId = msg["sessionId"] as string | undefined;
+        if (msgSessionId && msgSessionId !== this.sessionId && msgSessionId !== this.pendingSessionId) {
+          return;
+        }
+        const preConnectFailure = this.readyState !== 1;
+        if (msg["type"] === "tcp:error") {
+          const message = String(msg["message"] ?? "TCP error");
+          this.pendingCloseReason = preConnectFailure ? `Connection failed: ${message}` : `TCP error: ${message}`;
+        } else {
+          const reason = String(msg["reason"] ?? "Socket closed");
+          this.pendingCloseReason = preConnectFailure ? `Connection failed: ${reason}` : reason;
+        }
         this.flushPendingEvents();
       }
     };
@@ -900,6 +933,8 @@ class VsCodeTransport {
 
   private _close(reason: string): void {
     this.readyState = 3; // CLOSED
+    this.sessionId = null;
+    this.pendingSessionId = null;
     window.removeEventListener("message", this.msgHandler);
     this._onclose?.(new CloseEvent("close", { code: 1000, reason, wasClean: true }));
   }
@@ -955,6 +990,7 @@ function doConnect(): void {
 
   isConnecting = true;
   hasRenderedFirstFrame = false;
+  updateConnectionControls();
   updateConnectionSurface();
 
   client = new RfbClient({
@@ -970,7 +1006,9 @@ function doConnect(): void {
     onStatus: setStatus,
     onLog: postDebug,
     onDisconnect(reason) {
-      setStatus(`Disconnected: ${reason}`);
+      const message = reason?.trim() ? reason : "Socket closed";
+      const prefix = connected ? "Disconnected" : "Connection failed";
+      setStatus(`${prefix}: ${message}`);
       setConnected(false);
       canvas.style.cursor = "default";
       stopInitialResizeRetry();
@@ -978,7 +1016,6 @@ function doConnect(): void {
     },
   });
 
-  setConnected(true);
   client.connect();
   updateVisibilityRefreshPolicy();
   if (ENABLE_REMOTE_RESIZE) {

@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { TcpSession } from "./tcpSession";
+import { ConnectionManager, type ConnectionSnapshot, type PanelSessionState } from "./connectionManager";
 
 type EndpointEncodingMode = "auto" | "h264" | "tight" | "zrle" | "hextile" | "raw";
 type EndpointColorDepth = "8-bit" | "16-bit" | "24-bit";
@@ -65,39 +65,12 @@ interface LastSessionSnapshot {
   clipboardOverride?: EndpointClipboardOverride;
 }
 
-interface ConnectionSnapshot {
-  connected: boolean;
-  status: string;
-  protocol: string;
-  colorDepth: string;
-  autoProtocol: string;
-  autoColorDepth: string;
-  bandwidthBps: number;
-  updatesPerSecond: number;
-  avgFrameMs: number;
-  avgWorkerDecodeMs: number;
-  avgBlitMs: number;
-  latencyMs: number;
-  fps: number;
-  bottleneckHint: "server-limited" | "client-limited" | "balanced";
-  inflateBackend?: "wasm" | "fflate";
-  workerFallbackActive: boolean;
-  lastUpdated: number;
-}
-
 const SAVED_ENDPOINTS_KEY = "tigervncVscode.savedEndpoints";
 const LAST_SESSION_KEY = "tigervncVscode.lastSession";
 const LEGACY_SAVED_ENDPOINTS_KEY = "vncTcp.savedEndpoints";
 const SECRET_PREFIX = "tigervncVscode.password.";
 const LEGACY_SECRET_PREFIX = "vncTcp.password.";
 const SIDEBAR_STATS_REFRESH_MS = 250;
-
-interface PanelSessionState {
-  panel: vscode.WebviewPanel;
-  claimedEndpointKey: string | null;
-  activeThumbnailPath: string | null;
-  thumbnailVersion: number;
-}
 
 class SavedEndpointItem extends vscode.TreeItem {
   public snapshot: ConnectionSnapshot | undefined;
@@ -127,7 +100,9 @@ class SavedEndpointItem extends vscode.TreeItem {
       : vscode.TreeItemCollapsibleState.Collapsed;
     this.description = snapshot?.connected
       ? `${endpointAddress(this.endpoint)}  live`
-      : `${endpointAddress(this.endpoint)}${this.endpoint.hasPassword ? "  saved" : ""}`;
+      : snapshot?.status && snapshot.status !== "Idle"
+        ? `${endpointAddress(this.endpoint)}  ${snapshot.status}`
+        : `${endpointAddress(this.endpoint)}${this.endpoint.hasPassword ? "  saved" : ""}`;
     this.tooltip = [
       this.endpoint.name,
       endpointAddress(this.endpoint),
@@ -199,12 +174,12 @@ type VncTreeItem = SettingsItem | SavedEndpointItem | StatItem;
 class SavedEndpointsProvider implements vscode.TreeDataProvider<VncTreeItem> {
   private readonly emitter = new vscode.EventEmitter<VncTreeItem | undefined | null | void>();
   private readonly settingsItem = new SettingsItem();
-  private readonly endpointItems = new Map<string, SavedEndpointItem>();
   readonly onDidChangeTreeData = this.emitter.event;
 
   constructor(
     private readonly getEndpoints: () => SavedEndpoint[],
-    private readonly getSnapshot: (endpointId: string) => ConnectionSnapshot | undefined
+    private readonly getSnapshot: (endpointId: string) => ConnectionSnapshot | undefined,
+    private readonly onTreeRendered?: () => void
   ) {}
 
   refresh(item?: VncTreeItem): void {
@@ -212,14 +187,19 @@ class SavedEndpointsProvider implements vscode.TreeDataProvider<VncTreeItem> {
   }
 
   getTreeItem(element: VncTreeItem): vscode.TreeItem {
+    if (element instanceof SavedEndpointItem) {
+      element.update(this.getSnapshot(element.endpoint.id));
+    }
     return element;
   }
 
   getChildren(element?: VncTreeItem): VncTreeItem[] {
     if (!element) {
+      // Reconcile badge every time the root is queried
+      this.onTreeRendered?.();
       return [
         this.settingsItem,
-        ...this.getEndpoints().map((endpoint) => this.getOrCreateEndpointItem(endpoint)),
+        ...this.getEndpoints().map((endpoint) => this.createEndpointItem(endpoint)),
       ];
     }
 
@@ -235,6 +215,7 @@ class SavedEndpointsProvider implements vscode.TreeDataProvider<VncTreeItem> {
           "Clipboard override",
           element.endpoint.clipboardOverride === undefined ? "settings" : element.endpoint.clipboardOverride ? "enabled" : "disabled"
         ),
+        new StatItem(element.endpoint.id, "status", "Status", snap?.status ?? "Idle"),
       ];
 
       if (!snap?.connected) return overrideItems;
@@ -252,7 +233,6 @@ class SavedEndpointsProvider implements vscode.TreeDataProvider<VncTreeItem> {
         new StatItem(element.endpoint.id, "avgWorkerDecodeMs", "Worker", `${snap.avgWorkerDecodeMs.toFixed(1)} ms`),
         new StatItem(element.endpoint.id, "avgBlitMs", "Blit", `${snap.avgBlitMs.toFixed(1)} ms`),
         new StatItem(element.endpoint.id, "bottleneckHint", "Bottleneck", snap.bottleneckHint),
-        new StatItem(element.endpoint.id, "status", "Status", snap.status),
       ];
 
       if (snap.inflateBackend === "fflate") {
@@ -272,18 +252,11 @@ class SavedEndpointsProvider implements vscode.TreeDataProvider<VncTreeItem> {
   getEndpointItemById(endpointId: string): SavedEndpointItem | undefined {
     const endpoint = this.getEndpoints().find((candidate) => candidate.id === endpointId);
     if (!endpoint) return undefined;
-    return this.getOrCreateEndpointItem(endpoint);
+    return this.createEndpointItem(endpoint);
   }
 
-  private getOrCreateEndpointItem(endpoint: SavedEndpoint): SavedEndpointItem {
-    const existing = this.endpointItems.get(endpoint.id);
-    if (existing) {
-      existing.update(this.getSnapshot(endpoint.id));
-      return existing;
-    }
-    const created = new SavedEndpointItem(endpoint, this.getSnapshot(endpoint.id));
-    this.endpointItems.set(endpoint.id, created);
-    return created;
+  private createEndpointItem(endpoint: SavedEndpoint): SavedEndpointItem {
+    return new SavedEndpointItem(endpoint, this.getSnapshot(endpoint.id));
   }
 }
 
@@ -429,7 +402,7 @@ export function activate(context: vscode.ExtensionContext): void {
     output.appendLine(msg);
   };
 
-  logDebug("[VNC] Extension activated");
+  logError("[VNC] Extension activated");
 
   let endpoints = context.globalState.get<SavedEndpoint[]>(SAVED_ENDPOINTS_KEY, []);
   if (endpoints.length === 0) {
@@ -438,10 +411,8 @@ export function activate(context: vscode.ExtensionContext): void {
       endpoints = legacyEndpoints;
     }
   }
-  const connectionsByEndpointId = new Map<string, ConnectionSnapshot>();
-  const pendingSidebarRefreshes = new Map<string, ReturnType<typeof setTimeout>>();
-  const claimedPanelsByEndpoint = new Map<string, PanelSessionState>();
   const thumbnailsDir = vscode.Uri.joinPath(context.globalStorageUri, "thumbnails");
+  let connectionManager: ConnectionManager;
 
   const getDefaultClipboardSharing = (): boolean => {
     const cfg = vscode.workspace.getConfiguration("tigervncVscode");
@@ -471,22 +442,41 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const provider = new SavedEndpointsProvider(
     () => endpoints,
-    (endpointId) => connectionsByEndpointId.get(endpointId)
+    (endpointId) => connectionManager?.getSnapshot(endpointId),
+    () => reconcileBadge()
   );
   const treeView = vscode.window.createTreeView("tigervncVscode.savedEndpoints", {
     treeDataProvider: provider,
   });
   context.subscriptions.push(treeView);
 
-  const updateBadge = (): void => {
-    let activeCount = 0;
-    for (const snapshot of connectionsByEndpointId.values()) {
-      if (snapshot.connected) activeCount++;
-    }
+  // Reconcile badge from actual snapshot state on every tree render and explicit calls
+  const reconcileBadge = (): void => {
+    const activeCount = connectionManager ? connectionManager.getActiveConnectionCount() : 0;
+    console.error(`[VNC-BADGE] reconcileBadge called, activeCount=${activeCount}`);
+    treeView.description = activeCount > 0 ? `${activeCount} active` : undefined;
     treeView.badge = activeCount > 0
       ? { value: activeCount, tooltip: `${activeCount} active connection${activeCount > 1 ? "s" : ""}` }
       : undefined;
   };
+
+  const updateBadge = (_activeCount: number): void => {
+    console.error(`[VNC-BADGE] updateBadge callback, _activeCount=${_activeCount}`);
+    reconcileBadge();
+  };
+
+  // Also reconcile badge when the sidebar view becomes visible
+  treeView.onDidChangeVisibility(() => {
+    reconcileBadge();
+    provider.refresh();
+  });
+
+  // Periodic badge reconciliation as a safety net (every 2s)
+  const badgeReconcileTimer = setInterval(() => {
+    connectionManager.checkForOrphanedPanels();
+    reconcileBadge();
+  }, 2000);
+  context.subscriptions.push({ dispose: () => clearInterval(badgeReconcileTimer) });
 
   const endpointKeyFor = (host: string, port: number): string => `${host.trim().toLowerCase()}:${port}`;
 
@@ -514,36 +504,19 @@ export function activate(context: vscode.ExtensionContext): void {
       logDebug(
         `[VNC] Removing stale claimed panel for ${endpointKey}: ${err instanceof Error ? err.message : String(err)}`
       );
-      if (claimedPanelsByEndpoint.get(endpointKey) === state) {
-        claimedPanelsByEndpoint.delete(endpointKey);
-      }
-      state.claimedEndpointKey = null;
+      connectionManager.releaseClaim(state);
       return false;
     }
   };
 
-  const releaseClaim = (state: PanelSessionState): void => {
-    if (!state.claimedEndpointKey) return;
-    if (claimedPanelsByEndpoint.get(state.claimedEndpointKey) === state) {
-      claimedPanelsByEndpoint.delete(state.claimedEndpointKey);
-    }
-    state.claimedEndpointKey = null;
-  };
-
-  const claimEndpoint = (state: PanelSessionState, endpointKey: string): boolean => {
-    const existing = claimedPanelsByEndpoint.get(endpointKey);
-    if (existing && existing !== state) {
-      revealClaimedPanel(existing, endpointKey);
-      return false;
-    }
-    if (state.claimedEndpointKey === endpointKey) {
-      return true;
-    }
-    releaseClaim(state);
-    state.claimedEndpointKey = endpointKey;
-    claimedPanelsByEndpoint.set(endpointKey, state);
-    return true;
-  };
+  connectionManager = new ConnectionManager({
+    refreshAll: () => provider.refresh(),
+    updateBadge,
+    revealClaimedPanel,
+    postToPanel,
+    logDebug,
+    logError,
+  });
 
   const updatePanelThumbnail = async (state: PanelSessionState, endpointKey: string, dataUrl: string): Promise<void> => {
     const match = /^data:image\/png;base64,(.+)$/u.exec(dataUrl);
@@ -565,15 +538,15 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   const pushEndpointOverridesToActiveSession = (endpoint: SavedEndpoint): void => {
-    const activePanel = claimedPanelsByEndpoint.get(endpointKeyFor(endpoint.host, endpoint.port));
+    const activePanel = connectionManager.getClaimedPanel(endpointKeyFor(endpoint.host, endpoint.port));
     if (!activePanel) return;
     postToPanel(
       activePanel.panel,
       {
-      type: "vnc:applyEndpointOverrides",
-      protocolOverride: endpoint.protocolOverride,
-      colorDepthOverride: endpoint.colorDepthOverride,
-      clipboardEnabled: endpoint.clipboardOverride ?? getDefaultClipboardSharing(),
+        type: "vnc:applyEndpointOverrides",
+        protocolOverride: endpoint.protocolOverride,
+        colorDepthOverride: endpoint.colorDepthOverride,
+        clipboardEnabled: endpoint.clipboardOverride ?? getDefaultClipboardSharing(),
       },
       "applyEndpointOverrides"
     );
@@ -621,7 +594,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const clipboardEnabled = options?.clipboardOverride ?? defaultClipboardSharing;
       const initialEndpointKey = endpointKeyFor(defaultHost, defaultPort);
 
-      const existingPanel = claimedPanelsByEndpoint.get(initialEndpointKey);
+      const existingPanel = connectionManager.getClaimedPanel(initialEndpointKey);
       if (existingPanel) {
         if (revealClaimedPanel(existingPanel, initialEndpointKey)) {
           return;
@@ -659,59 +632,8 @@ export function activate(context: vscode.ExtensionContext): void {
         activeThumbnailPath: null,
         thumbnailVersion: 0,
       };
-      void claimEndpoint(panelState, initialEndpointKey);
-
-      // One active TCP session per panel (the webview owns connect/disconnect).
-      let activeSession: TcpSession | null = null;
-      let currentSnapshotKey = endpointId ?? initialEndpointKey;
-
-      const scheduleSidebarRefresh = (snapshotKey: string, throttleMs: number): void => {
-        if (!endpointId) return;
-        if (pendingSidebarRefreshes.has(snapshotKey)) return;
-        const timer = setTimeout(() => {
-          pendingSidebarRefreshes.delete(snapshotKey);
-          const item = provider.getEndpointItemById(snapshotKey);
-          if (item) {
-            provider.refresh(item);
-          }
-        }, throttleMs);
-        pendingSidebarRefreshes.set(snapshotKey, timer);
-      };
-
-      const updateSnapshot = (patch: Partial<ConnectionSnapshot>, throttleMs = 0): void => {
-        const previous = connectionsByEndpointId.get(currentSnapshotKey);
-        const next: ConnectionSnapshot = {
-          connected: false,
-          status: "Idle",
-          protocol: "None",
-          colorDepth: "24-bit RGBX",
-          autoProtocol: "auto",
-          autoColorDepth: "24-bit",
-          bandwidthBps: 0,
-          updatesPerSecond: 0,
-          avgFrameMs: 0,
-          avgWorkerDecodeMs: 0,
-          avgBlitMs: 0,
-          latencyMs: 0,
-          fps: 0,
-          bottleneckHint: "balanced",
-          workerFallbackActive: false,
-          ...previous,
-          ...patch,
-          lastUpdated: Date.now(),
-        };
-        connectionsByEndpointId.set(currentSnapshotKey, next);
-        if (patch.connected !== undefined && patch.connected !== previous?.connected) {
-          updateBadge();
-        }
-        if (!endpointId) return;
-        if (throttleMs > 0) {
-          scheduleSidebarRefresh(currentSnapshotKey, throttleMs);
-          return;
-        }
-        const item = provider.getEndpointItemById(currentSnapshotKey);
-        provider.refresh(item);
-      };
+      connectionManager.registerPanel(panelState, endpointId, endpointId ?? initialEndpointKey);
+      void connectionManager.claim(panelState, initialEndpointKey);
 
       panel.webview.onDidReceiveMessage((msg: WebviewToExtMessage) => {
         if (msg.type === "connect") {
@@ -727,7 +649,7 @@ export function activate(context: vscode.ExtensionContext): void {
             clipboardOverride: latestEndpoint?.clipboardOverride ?? options?.clipboardOverride,
           });
           const requestedEndpointKey = endpointKeyFor(msg.host, msg.port);
-          if (!claimEndpoint(panelState, requestedEndpointKey)) {
+          if (!connectionManager.claim(panelState, requestedEndpointKey)) {
             postToPanel(panel, {
               type: "vnc:status",
               message: `Already connected: ${requestedEndpointKey}`,
@@ -735,66 +657,18 @@ export function activate(context: vscode.ExtensionContext): void {
             return;
           }
           if (!endpointId) {
-            currentSnapshotKey = requestedEndpointKey;
+            connectionManager.setSnapshotKey(panelState, requestedEndpointKey);
           }
-          updateSnapshot({ status: `Connecting to ${msg.host}:${msg.port}` });
-          // Tear down any pre-existing session first.
-          activeSession?.disconnect();
-
-          activeSession = new TcpSession(msg.host, msg.port, (event) => {
-            switch (event.type) {
-              case "connected":
-                logDebug(`[VNC] TCP connected ${msg.host}:${msg.port} (${event.sessionId})`);
-                postToPanel(panel, { type: "tcp:connected", sessionId: event.sessionId }, "tcpConnected");
-                updateSnapshot({ connected: true, status: "Connected" });
-                break;
-              case "data":
-                postToPanel(panel, {
-                  type: "tcp:data",
-                  sessionId: event.sessionId,
-                  payloadBase64: event.payloadBase64,
-                }, "tcpData");
-                break;
-              case "closed":
-                logDebug(`[VNC] TCP closed ${msg.host}:${msg.port} (${event.sessionId}): ${event.reason ?? "Socket closed"}`);
-                postToPanel(panel, {
-                  type: "tcp:closed",
-                  sessionId: event.sessionId,
-                  reason: event.reason ?? "Socket closed",
-                }, "tcpClosed");
-                activeSession = null;
-                releaseClaim(panelState);
-                updateSnapshot({ connected: false, status: event.reason ?? "Socket closed" });
-                break;
-              case "error":
-                logError(`[VNC] ERROR: TCP error ${msg.host}:${msg.port} (${event.sessionId}): ${event.message}`);
-                postToPanel(panel, {
-                  type: "tcp:error",
-                  sessionId: event.sessionId,
-                  message: event.message,
-                }, "tcpError");
-                releaseClaim(panelState);
-                updateSnapshot({ connected: false, status: `Error: ${event.message}` });
-                break;
-            }
-          });
-          activeSession.connect();
+          connectionManager.updateSnapshot(panelState, { status: `Connecting to ${msg.host}:${msg.port}` });
+          connectionManager.connect(panelState, msg.host, msg.port);
         } else if (msg.type === "write") {
-          if (activeSession?.sessionId === msg.sessionId) {
-            activeSession.writeBase64(msg.payloadBase64);
-          }
+          connectionManager.write(panelState, msg.sessionId, msg.payloadBase64);
         } else if (msg.type === "disconnect") {
-          if (activeSession?.sessionId === msg.sessionId) {
-            logDebug(`[VNC] Disconnect requested for session ${msg.sessionId}`);
-            activeSession.disconnect();
-            activeSession = null;
-            releaseClaim(panelState);
-            updateSnapshot({ connected: false, status: "Disconnected" });
-          }
+          connectionManager.disconnect(panelState, msg.sessionId, "Disconnected");
         } else if (msg.type === "vnc:thumbnail") {
           // Ignore dynamic thumbnails; using static TigerVNC icon instead
         } else if (msg.type === "vnc:stats") {
-          updateSnapshot({
+          connectionManager.updateSnapshot(panelState, {
             protocol: msg.stats.encoding,
             colorDepth: msg.stats.colorDepth,
             autoProtocol: msg.stats.autoProtocol ?? "auto",
@@ -812,44 +686,27 @@ export function activate(context: vscode.ExtensionContext): void {
           }, SIDEBAR_STATS_REFRESH_MS);
         } else if (msg.type === "vnc:status") {
           logDebug(`[VNC] Webview status: ${msg.message}`);
-          updateSnapshot({ status: msg.message });
+          connectionManager.updateSnapshot(panelState, { status: msg.message });
         } else if (msg.type === "vnc:debug") {
           logDebug(`[VNC][DBG] ${msg.message}`);
         } else if (msg.type === "vnc:openSettings") {
           logDebug("[VNC] Webview requested settings");
           void vscode.commands.executeCommand("tigervncVscode.openSettings");
         } else if (msg.type === "vnc:connectedState") {
-          logDebug(`[VNC] Webview connected state: ${msg.connected}`);
-          updateSnapshot({ connected: msg.connected });
+          // Ignored: the ConnectionManager tracks connected state via TCP events
+          // (tcp:connected / tcp:closed / tcp:error). Letting the webview override
+          // connected state caused races where a late message re-asserted connected=true
+          // after the panel had already been disposed.
+          logDebug(`[VNC] Webview connected state (ignored): ${msg.connected}`);
         }
       });
 
       panel.onDidDispose(() => {
-        logDebug(`[VNC] Session panel disposed for ${panel.title}`);
-        activeSession?.disconnect();
-        activeSession = null;
-        releaseClaim(panelState);
-        const pending = pendingSidebarRefreshes.get(currentSnapshotKey);
-        if (pending) {
-          clearTimeout(pending);
-          pendingSidebarRefreshes.delete(currentSnapshotKey);
-        }
+        logError(`[VNC] Panel disposed: ${panel.title}`);
+        connectionManager.disposePanel(panelState);
         if (panelState.activeThumbnailPath) {
           void rm(panelState.activeThumbnailPath, { force: true });
         }
-        // Remove snapshot for ad-hoc connections, update for saved endpoints
-        if (!endpointId) {
-          connectionsByEndpointId.delete(currentSnapshotKey);
-        } else {
-          connectionsByEndpointId.set(currentSnapshotKey, {
-            ...connectionsByEndpointId.get(currentSnapshotKey),
-            connected: false,
-            status: "Panel closed",
-            lastUpdated: Date.now(),
-          } as ConnectionSnapshot);
-          provider.refresh(provider.getEndpointItemById(endpointId));
-        }
-        updateBadge();
       });
 
       panel.onDidChangeViewState((event) => {

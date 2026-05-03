@@ -2,7 +2,7 @@
   "name": "tigervnc-vscode",
   "displayName": "TigerVNC VS Code Viewer",
   "description": "VS Code VNC extension that connects directly over TCP (no WebSocket transport).",
-  "version": "0.1.33",
+  "version": "0.1.38",
   "publisher": "tigervnc",
   "icon": "media/tigervnc_128.png",
   "engines": {
