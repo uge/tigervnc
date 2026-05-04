@@ -1577,7 +1577,11 @@ export class RfbClient {
       this.lastReceivedRate = receivedRate;
       this.lastUpdatesPerSecond = this.updatesWindow;
       this.updatesWindow = 0;
-      if (this.frameSamplesWindow > 0) {
+
+      // If no frame has arrived for more than 5 seconds, clear timing stats
+      const stale = this.lastFrameUpdateTime > 0 && (Date.now() - this.lastFrameUpdateTime) > 5000;
+
+      if (this.frameSamplesWindow > 0 && !stale) {
         this.lastAvgFrameMs = this.frameMsWindow / this.frameSamplesWindow;
         this.lastAvgWorkerDecodeMs = this.workerDecodeMsWindow / this.frameSamplesWindow;
         this.lastAvgBlitMs = this.blitMsWindow / this.frameSamplesWindow;
@@ -1586,8 +1590,11 @@ export class RfbClient {
         this.lastAvgWorkerDecodeMs = 0;
         this.lastAvgBlitMs = 0;
       }
+      if (stale) {
+        this.frameRTT = 0;
+      }
       const tightTotalMs = this.tightInflateMsWindow + this.tightExpandMsWindow + this.tightJpegMsWindow;
-      if (tightTotalMs > 0) {
+      if (tightTotalMs > 0 && !stale) {
         this.lastTightWorkerBreakdown = `exp ${this.tightExpandMsWindow.toFixed(1)} infl ${this.tightInflateMsWindow.toFixed(1)} jpg ${this.tightJpegMsWindow.toFixed(1)}`;
       } else {
         this.lastTightWorkerBreakdown = "-";

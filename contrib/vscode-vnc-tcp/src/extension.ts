@@ -713,6 +713,9 @@ export function activate(context: vscode.ExtensionContext): void {
         if (event.webviewPanel.visible) {
           logDebug(`[VNC] Session panel exposed: ${event.webviewPanel.title}`);
           postToPanel(event.webviewPanel, { type: "vnc:exposed" }, "panelExposed");
+        } else {
+          logDebug(`[VNC] Session panel hidden: ${event.webviewPanel.title}`);
+          postToPanel(event.webviewPanel, { type: "vnc:hidden" }, "panelHidden");
         }
       });
 

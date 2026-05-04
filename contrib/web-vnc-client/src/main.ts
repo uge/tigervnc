@@ -110,6 +110,7 @@ let lastSurfaceSignature = "";
 let fpsWindowStart = 0;
 let fpsWindowFrames = 0;
 let currentFps = 0;
+let lastRenderedFrameTime = 0;
 let thumbnailCanvas: HTMLCanvasElement | null = null;
 let thumbnailCtx: CanvasRenderingContext2D | null = null;
 let lastThumbnailSentAt = 0;
@@ -222,6 +223,14 @@ function formatDataRate(bytesPerSecond: number): string {
 }
 
 function setStats(stats: RfbClientStats): void {
+  // Clear FPS when no frame has been rendered for more than 5 seconds
+  if (lastRenderedFrameTime > 0 && (performance.now() - lastRenderedFrameTime) > 5000) {
+    currentFps = 0;
+    fpsWindowStart = 0;
+    fpsWindowFrames = 0;
+    el("stat-fps").textContent = "0.0";
+  }
+
   el("stat-current-encoding").textContent = stats.encoding;
   el("stat-depth").textContent = stats.colorDepth;
   el("stat-rate").textContent = formatDataRate(stats.receivedRate);
@@ -312,6 +321,7 @@ function maybeAdaptProtocolAndDepth(stats: RfbClientStats): void {
 }
 
 function trackRenderedFrame(now: number): void {
+  lastRenderedFrameTime = now;
   if (fpsWindowStart === 0) {
     fpsWindowStart = now;
     fpsWindowFrames = 0;
@@ -1223,7 +1233,12 @@ function init(): void {
       clipboardEnabled?: boolean;
     } | undefined;
     if (msg?.type === "vnc:exposed") {
+      if (client) client.setTargetFrameRate(FOREGROUND_REFRESH_FPS);
       forceRedraw();
+      return;
+    }
+    if (msg?.type === "vnc:hidden") {
+      if (client) client.setTargetFrameRate(BACKGROUND_REFRESH_FPS);
       return;
     }
     if (msg?.type === "vnc:applyEndpointOverrides") {
